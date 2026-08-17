@@ -80,8 +80,9 @@ type Handshaking<Q, B> =
 /// Likewise for sending GOAWAY. The connection is moved into the future and
 /// handed back when it resolves, so the write is never cancelled part-way and
 /// the frame cannot be left half-queued.
-type GoingAway<Q, B> =
-    Pin<Box<dyn Future<Output = (H3Conn<Q, B>, Result<(), h3::error::ConnectionError>)> + Send>>;
+type GoingAway<Q, B> = Pin<
+    Box<dyn Future<Output = (Box<H3Conn<Q, B>>, Result<(), h3::error::ConnectionError>)> + Send>,
+>;
 
 enum State<Q, B>
 where
@@ -90,7 +91,9 @@ where
     B: Buf,
 {
     Handshaking(Handshaking<Q, B>),
-    Accepting(H3Conn<Q, B>),
+    /// Boxed so a large `h3::server::Connection` does not inflate every
+    /// variant of this enum.
+    Accepting(Box<H3Conn<Q, B>>),
     GoingAway(GoingAway<Q, B>),
     Done,
 }
@@ -181,7 +184,7 @@ where
                     match result {
                         Ok(conn) => {
                             trace!("http3 handshake complete");
-                            self.state = State::Accepting(conn);
+                            self.state = State::Accepting(Box::new(conn));
                         }
                         Err(err) => {
                             self.state = State::Done;

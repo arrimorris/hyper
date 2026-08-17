@@ -1,2 +1,4 @@
 target
 Cargo.lock
+# written by the http3_server example
+hyper-http3-cert.der

@@ -132,6 +132,11 @@ pub trait SendStream<B: Buf> {
     /// Implementations may assume [`poll_ready`] returned
     /// [`Ready`](Poll::Ready) since the last call.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream or the connection has already failed, so
+    /// the data can never be sent.
+    ///
     /// [`poll_ready`]: SendStream::poll_ready
     fn send_data(&mut self, data: WriteBuf<B>) -> Result<(), StreamError>;
 

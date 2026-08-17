@@ -19,6 +19,7 @@ jobs:
       - style
       - lint
       - test
+      - http3
       - msrv
       - miri
       - features
@@ -181,14 +182,53 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: check --feature-powerset
-        run: cargo hack --no-dev-deps check --feature-powerset --depth 2 --skip ffi,tracing
+        run: cargo hack --no-dev-deps check --feature-powerset --depth 2 --skip ffi,http3,tracing
         env:
           RUSTFLAGS: "-D dead_code -D unused_imports"
 
       - name: check --feature-powerset with tracing feature
-        run: cargo hack --no-dev-deps check --feature-powerset --depth 2 --features tracing --skip ffi
+        run: cargo hack --no-dev-deps check --feature-powerset --depth 2 --features tracing --skip ffi,http3
         env:
           RUSTFLAGS: "--cfg hyper_unstable_tracing -D dead_code -D unused_imports"
+
+  http3:
+    name: Test HTTP/3 (QUIC)
+    needs: [style]
+    runs-on: ubuntu-latest
+    env:
+      # HTTP/3 is unstable, and the feature alone is deliberately inert.
+      RUSTFLAGS: --cfg hyper_unstable_quic
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # Note: not the MSRV toolchain. `h3` requires a newer Rust than hyper,
+      # which is also why `http3` is not part of `full`.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check feature combinations
+        env:
+          RUSTFLAGS: "--cfg hyper_unstable_quic -D dead_code -D unused_imports"
+        run: |
+          cargo check --features http3
+          cargo check --features http3,client
+          cargo check --features http3,server
+          cargo check --features http3,client,server
+          cargo check --features full,http3
+
+      - name: Clippy
+        run: cargo clippy --features http3,client,server -- -D warnings
+
+      - name: Test
+        run: cargo test --features http3,client,server --test http3
+
+      - name: Build examples
+        run: |
+          cargo check --features http3,server --example http3_server
+          cargo check --features http3,client --example http3_client
 
   ffi:
     name: Test C API (FFI)
@@ -285,7 +325,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo doc
-        run: cargo rustdoc --features full,ffi -- --cfg docsrs --cfg hyper_unstable_ffi -D rustdoc::broken-intra-doc-links
+        run: cargo rustdoc --features full,ffi,http3 -- --cfg docsrs --cfg hyper_unstable_ffi --cfg hyper_unstable_quic -D rustdoc::broken-intra-doc-links
 
   check-external-types:
     name: Check exposed types
