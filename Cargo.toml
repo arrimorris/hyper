@@ -32,7 +32,13 @@ futures-channel = { version = "0.3", optional = true }
 futures-core = { version = "0.3.31", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"], optional = true }
 h2 = { version = "0.4.14", optional = true }
-h3 = { version = "0.0.8", optional = true }
+# The `i-implement-a-third-party-backend...` feature is what h3 calls its
+# embedder API. hyper is exactly that embedder: it implements `h3::quic` on
+# top of `hyper::rt::quic`, and drives the connection with h3's poll-based
+# accept loop instead of its `async fn` conveniences.
+h3 = { version = "0.0.8", optional = true, features = [
+    "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
+] }
 http-body-util = { version = "0.1", optional = true }
 httparse = { version = "1.9", optional = true }
 httpdate = { version = "1.0", optional = true }
@@ -69,11 +75,21 @@ tokio = { version = "1", features = [
 tokio-test = "0.4"
 tokio-util = "0.7.10"
 
+# Used only by the `http3` tests and examples, which drive `hyper::rt::quic`
+# with a real QUIC stack. hyper itself never depends on a QUIC implementation.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std"] }
+rcgen = "0.13"
+
 [features]
 # Nothing by default
-default = ["http3", "server"]
+default = []
 
 # Easily turn it all on
+#
+# NOTE: `http3` is deliberately *not* included. The `h3` crate requires Rust
+# 1.70, above hyper's MSRV, so pulling it into `full` would break the MSRV job.
+# It is also still unstable and requires `--cfg hyper_unstable_quic`.
 full = [
     "client",
     "http1",
@@ -84,7 +100,8 @@ full = [
 # HTTP versions
 http1 = ["dep:atomic-waker", "dep:futures-channel", "dep:futures-core", "dep:httparse", "dep:itoa"]
 http2 = ["dep:atomic-waker", "dep:futures-channel", "dep:futures-core", "dep:h2"]
-http3 = ["dep:h3"]
+# HTTP/3 over QUIC (currently unstable (no semver), requires `--cfg hyper_unstable_quic`)
+http3 = ["dep:futures-core", "dep:h3", "dep:pin-project-lite"]
 
 # Client/Server
 client = ["dep:want", "dep:pin-project-lite", "dep:smallvec"]
@@ -207,8 +224,15 @@ unnecessary_safety_comment = "allow" # more safety comments are a good thing
 unseparated_literal_suffix = "allow" # i don't like 0_u8 (do i?)
 
 [package.metadata.docs.rs]
-features = ["ffi", "full", "tracing"]
-rustdoc-args = ["--cfg", "hyper_unstable_ffi", "--cfg", "hyper_unstable_tracing"]
+features = ["ffi", "full", "http3", "tracing"]
+rustdoc-args = [
+    "--cfg",
+    "hyper_unstable_ffi",
+    "--cfg",
+    "hyper_unstable_quic",
+    "--cfg",
+    "hyper_unstable_tracing",
+]
 
 [package.metadata.playground]
 features = ["full"]
@@ -330,6 +354,22 @@ name = "server"
 path = "benches/server.rs"
 required-features = ["full"]
 
+
+[[example]]
+name = "http3_server"
+path = "examples/http3_server.rs"
+required-features = ["http3", "server"]
+
+[[example]]
+name = "http3_client"
+path = "examples/http3_client.rs"
+required-features = ["http3", "client"]
+
+
+[[test]]
+name = "http3"
+path = "tests/http3.rs"
+required-features = ["http3", "client", "server"]
 
 [[test]]
 name = "client"

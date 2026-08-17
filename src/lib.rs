@@ -81,7 +81,11 @@
 //! The following is a list of feature flags and their corresponding `RUSTFLAG`:
 //!
 //! - `ffi`: Enables C API for hyper `hyper_unstable_ffi`.
+//! - `http3`: Enables HTTP/3 over QUIC with `hyper_unstable_quic`.
 //! - `tracing`: Enables debug logging with `hyper_unstable_tracing`.
+//!
+//! Note that `http3` also requires a newer Rust than hyper's MSRV, because the
+//! `h3` crate does, which is why it is not part of the `full` feature.
 //!
 //! For example:
 //!
@@ -121,6 +125,14 @@ extern crate test;
 pub use http::{header, HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 
 pub use crate::error::{Error, Result};
+
+#[cfg(all(feature = "http3", not(hyper_unstable_quic)))]
+compile_error!(
+    "\
+    The `http3` feature is unstable, and requires the \
+    `RUSTFLAGS='--cfg hyper_unstable_quic'` environment variable to be set.\
+"
+);
 
 #[macro_use]
 mod cfg;

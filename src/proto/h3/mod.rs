@@ -1,34 +1,170 @@
-use std::future::Future;
-use std::pin::Pin;
+//! HTTP/3.
+//!
+//! hyper does not implement the HTTP/3 wire format itself; it drives the `h3`
+//! crate the same way it drives `h2` for HTTP/2. What lives here is the part
+//! hyper *does* own: bridging [`hyper::rt::quic`](crate::rt::quic) to
+//! `h3::quic` (see [`glue`]), turning h3's streams into
+//! [`Incoming`](crate::body::Incoming) bodies, and routing requests through a
+//! [`Service`](crate::service::Service).
+
 use std::task::{Context, Poll};
 
-use bytes::Buf;
-use h3::server::Connection;
+use bytes::{Buf, Bytes};
+use futures_core::ready;
+use http_body::Frame;
 
-use pin_project_lite::pin_project;
+pub(crate) mod glue;
 
-mod glue;
+#[cfg(feature = "client")]
+pub(crate) mod client;
+#[cfg(feature = "server")]
+pub(crate) mod server;
 
-pin_project! {
-    pub(crate) struct Server<Q, S, B, E>
-    where
-        Q: crate::rt::quic::Connection<B>,
-        B: Buf,
-    {
-        exec: E,
-        q: Connection<glue::Conn<Q>, B>,
-        s: S,
+// ===== errors =====
+
+/// Map an h3 connection error onto a `hyper::Error`.
+///
+/// A connection that ended with `H3_NO_ERROR` ended cleanly; that is not a
+/// failure and must not be reported as one.
+pub(crate) fn conn_error(err: h3::error::ConnectionError) -> Option<crate::Error> {
+    if err.is_h3_no_error() {
+        None
+    } else {
+        Some(crate::Error::new_h3(err))
     }
 }
 
-impl<Q, S, B, E> Future for Server<Q, S, B, E>
-where
-    Q: crate::rt::quic::Connection<B>,
-    B: Buf,
-{
-    type Output = crate::Result<()>;
+// ===== bodies =====
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        todo!()
-    }
+/// The receiving half of an HTTP/3 request or response body.
+///
+/// [`Incoming`](crate::body::Incoming) is a concrete type, but an h3 stream is
+/// generic over the QUIC backend, so the two meet behind this trait. The
+/// implementations below hold the h3 stream itself rather than pumping it
+/// through a channel: polling for a frame reads straight from the QUIC stream,
+/// so *not* polling leaves the data in the transport's receive window and the
+/// peer stops sending. That is what keeps QUIC's flow control connected to
+/// `Body` backpressure.
+pub(crate) trait RecvBody: Send + Sync + 'static {
+    /// Poll for the next body frame.
+    fn poll_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, crate::Error>>>;
+
+    /// Whether the stream is known to be finished.
+    fn is_end_stream(&self) -> bool;
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecvState {
+    Data,
+    Trailers,
+    Done,
+}
+
+/// Convert whatever `Buf` the backend produced into `Bytes`.
+///
+/// For a backend that already hands out `Bytes` — which is every backend worth
+/// having — `copy_to_bytes` is a refcount bump, not a copy.
+fn to_bytes(mut buf: impl Buf) -> Bytes {
+    buf.copy_to_bytes(buf.remaining())
+}
+
+/// Generate a [`RecvBody`] over one of h3's two `RequestStream` types.
+///
+/// `h3::server::RequestStream` and `h3::client::RequestStream` have the same
+/// receive API but are distinct types, and neither exposes a shared trait for
+/// it, so the implementation is generated for each.
+macro_rules! recv_body {
+    ($name:ident, $stream:ty) => {
+        pub(crate) struct $name<S, B>
+        where
+            S: h3::quic::RecvStream,
+            B: Buf,
+        {
+            stream: $stream,
+            state: RecvState,
+        }
+
+        impl<S, B> $name<S, B>
+        where
+            S: h3::quic::RecvStream,
+            B: Buf,
+        {
+            pub(crate) fn new(stream: $stream) -> Self {
+                Self {
+                    stream,
+                    state: RecvState::Data,
+                }
+            }
+        }
+
+        impl<S, B> RecvBody for $name<S, B>
+        where
+            S: h3::quic::RecvStream + Send + Sync + 'static,
+            B: Buf + Send + Sync + 'static,
+        {
+            fn poll_frame(
+                &mut self,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Bytes>, crate::Error>>> {
+                if self.state == RecvState::Data {
+                    match ready!(self.stream.poll_recv_data(cx)) {
+                        Ok(Some(buf)) => return Poll::Ready(Some(Ok(Frame::data(to_bytes(buf))))),
+                        Ok(None) => self.state = RecvState::Trailers,
+                        Err(err) => {
+                            self.state = RecvState::Done;
+                            // An early response resets the request stream with
+                            // `H3_NO_ERROR`. Like HTTP/2's `RST_STREAM(NO_ERROR)`,
+                            // that ends the body, it does not fail it.
+                            return Poll::Ready(if err.is_h3_no_error() {
+                                None
+                            } else {
+                                Some(Err(crate::Error::new_h3_stream(err)))
+                            });
+                        }
+                    }
+                }
+
+                if self.state == RecvState::Trailers {
+                    let trailers = ready!(self.stream.poll_recv_trailers(cx));
+                    self.state = RecvState::Done;
+                    return Poll::Ready(match trailers {
+                        Ok(Some(map)) => Some(Ok(Frame::trailers(map))),
+                        Ok(None) => None,
+                        Err(err) if err.is_h3_no_error() => None,
+                        Err(err) => Some(Err(crate::Error::new_h3_stream(err))),
+                    });
+                }
+
+                Poll::Ready(None)
+            }
+
+            fn is_end_stream(&self) -> bool {
+                self.state == RecvState::Done
+            }
+        }
+
+        impl<S, B> Drop for $name<S, B>
+        where
+            S: h3::quic::RecvStream,
+            B: Buf,
+        {
+            fn drop(&mut self) {
+                if self.state != RecvState::Done {
+                    // The body was dropped without being read to the end —
+                    // usually a handler that ignored the request body. Tell the
+                    // peer to stop sending rather than letting it push bytes at
+                    // a window nobody will ever drain.
+                    self.stream.stop_sending(h3::error::Code::H3_NO_ERROR);
+                }
+            }
+        }
+    };
+}
+
+#[cfg(feature = "server")]
+recv_body!(ServerRecvBody, h3::server::RequestStream<S, B>);
+#[cfg(feature = "client")]
+recv_body!(ClientRecvBody, h3::client::RequestStream<S, B>);

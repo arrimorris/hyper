@@ -8,7 +8,11 @@ use bytes::Bytes;
 #[cfg(all(feature = "http1", any(feature = "client", feature = "server")))]
 use futures_channel::{mpsc, oneshot};
 #[cfg(all(
-    any(feature = "http1", feature = "http2"),
+    any(
+        feature = "http1",
+        feature = "http2",
+        all(feature = "http3", hyper_unstable_quic)
+    ),
     any(feature = "client", feature = "server")
 ))]
 use futures_core::ready;
@@ -19,7 +23,11 @@ use http::HeaderMap;
 use http_body::{Body, Frame, SizeHint};
 
 #[cfg(all(
-    any(feature = "http1", feature = "http2"),
+    any(
+        feature = "http1",
+        feature = "http2",
+        all(feature = "http3", hyper_unstable_quic)
+    ),
     any(feature = "client", feature = "server")
 ))]
 use super::DecodedLength;
@@ -68,6 +76,22 @@ enum Kind {
         data_done: bool,
         ping: ping::Recorder,
         recv: h2::RecvStream,
+    },
+    /// A body being received on an HTTP/3 (QUIC) stream.
+    ///
+    /// Unlike `Chan`, this is not fed by a background task pushing into a
+    /// channel: the QUIC stream itself is held here, so polling for a frame
+    /// reads from the transport directly and *not* polling leaves the bytes in
+    /// the QUIC flow-control window. Backpressure therefore reaches the peer
+    /// without hyper having to model it.
+    #[cfg(all(
+        feature = "http3",
+        hyper_unstable_quic,
+        any(feature = "client", feature = "server")
+    ))]
+    H3 {
+        content_length: DecodedLength,
+        recv: Box<dyn crate::proto::h3::RecvBody>,
     },
     #[cfg(feature = "ffi")]
     Ffi(crate::ffi::UserBody),
@@ -170,6 +194,21 @@ impl Incoming {
         })
     }
 
+    #[cfg(all(
+        feature = "http3",
+        hyper_unstable_quic,
+        any(feature = "client", feature = "server")
+    ))]
+    pub(crate) fn h3(
+        recv: Box<dyn crate::proto::h3::RecvBody>,
+        content_length: DecodedLength,
+    ) -> Self {
+        Incoming::new(Kind::H3 {
+            content_length,
+            recv,
+        })
+    }
+
     #[cfg(feature = "ffi")]
     pub(crate) fn as_ffi_mut(&mut self) -> &mut crate::ffi::UserBody {
         if !matches!(self.kind, Kind::Ffi(_)) {
@@ -190,7 +229,11 @@ impl Body for Incoming {
     fn poll_frame(
         #[cfg_attr(
             not(all(
-                any(feature = "http1", feature = "http2"),
+                any(
+                    feature = "http1",
+                    feature = "http2",
+                    all(feature = "http3", hyper_unstable_quic)
+                ),
                 any(feature = "client", feature = "server")
             )),
             allow(unused_mut)
@@ -198,7 +241,11 @@ impl Body for Incoming {
         mut self: Pin<&mut Self>,
         #[cfg_attr(
             not(all(
-                any(feature = "http1", feature = "http2"),
+                any(
+                    feature = "http1",
+                    feature = "http2",
+                    all(feature = "http3", hyper_unstable_quic)
+                ),
                 any(feature = "client", feature = "server")
             )),
             allow(unused_variables)
@@ -280,6 +327,24 @@ impl Body for Incoming {
                 }
             }
 
+            #[cfg(all(
+                feature = "http3",
+                hyper_unstable_quic,
+                any(feature = "client", feature = "server")
+            ))]
+            Kind::H3 {
+                content_length: len,
+                recv,
+            } => match ready!(recv.poll_frame(cx)) {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        len.sub_if(data.len() as u64);
+                    }
+                    Poll::Ready(Some(Ok(frame)))
+                }
+                other => Poll::Ready(other),
+            },
+
             #[cfg(feature = "ffi")]
             Kind::Ffi(body) => body.poll_data(cx),
         }
@@ -292,6 +357,15 @@ impl Body for Incoming {
             Kind::Chan { content_length, .. } => *content_length == DecodedLength::ZERO,
             #[cfg(all(feature = "http2", any(feature = "client", feature = "server")))]
             Kind::H2 { recv: h2, .. } => h2.is_end_stream(),
+            #[cfg(all(
+                feature = "http3",
+                hyper_unstable_quic,
+                any(feature = "client", feature = "server")
+            ))]
+            Kind::H3 {
+                content_length,
+                recv,
+            } => *content_length == DecodedLength::ZERO || recv.is_end_stream(),
             #[cfg(feature = "ffi")]
             Kind::Ffi(..) => false,
         }
@@ -299,7 +373,11 @@ impl Body for Incoming {
 
     fn size_hint(&self) -> SizeHint {
         #[cfg(all(
-            any(feature = "http1", feature = "http2"),
+            any(
+                feature = "http1",
+                feature = "http2",
+                all(feature = "http3", hyper_unstable_quic)
+            ),
             any(feature = "client", feature = "server")
         ))]
         fn opt_len(decoded_length: DecodedLength) -> SizeHint {
@@ -316,6 +394,12 @@ impl Body for Incoming {
             Kind::Chan { content_length, .. } => opt_len(content_length),
             #[cfg(all(feature = "http2", any(feature = "client", feature = "server")))]
             Kind::H2 { content_length, .. } => opt_len(content_length),
+            #[cfg(all(
+                feature = "http3",
+                hyper_unstable_quic,
+                any(feature = "client", feature = "server")
+            ))]
+            Kind::H3 { content_length, .. } => opt_len(content_length),
             #[cfg(feature = "ffi")]
             Kind::Ffi(..) => SizeHint::default(),
         }
@@ -326,7 +410,11 @@ impl fmt::Debug for Incoming {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         #[cfg(any(
             all(
-                any(feature = "http1", feature = "http2"),
+                any(
+                    feature = "http1",
+                    feature = "http2",
+                    all(feature = "http3", hyper_unstable_quic)
+                ),
                 any(feature = "client", feature = "server")
             ),
             feature = "ffi"
@@ -341,7 +429,11 @@ impl fmt::Debug for Incoming {
             Kind::Empty => builder.field(&Empty),
             #[cfg(any(
                 all(
-                    any(feature = "http1", feature = "http2"),
+                    any(
+                        feature = "http1",
+                        feature = "http2",
+                        all(feature = "http3", hyper_unstable_quic)
+                    ),
                     any(feature = "client", feature = "server")
                 ),
                 feature = "ffi"

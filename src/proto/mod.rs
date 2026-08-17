@@ -16,8 +16,83 @@ cfg_feature! {
 #[cfg(feature = "http2")]
 pub(crate) mod h2;
 
-#[cfg(feature = "http3")]
+#[cfg(all(feature = "http3", hyper_unstable_quic))]
 pub(crate) mod h3;
+
+// ===== connection header handling, shared by HTTP/2 and HTTP/3 =====
+//
+// Both protocols multiplex over a shared connection, so both forbid the
+// hop-by-hop headers that HTTP/1 used to negotiate that connection. The rules
+// in RFC 9113 §8.2.2 and RFC 9114 §4.2 are the same, so the code is too.
+
+#[cfg(any(feature = "http2", all(feature = "http3", hyper_unstable_quic)))]
+pub(crate) use self::connection_headers::{strip_connection_headers, MessageKind};
+
+#[cfg(any(feature = "http2", all(feature = "http3", hyper_unstable_quic)))]
+mod connection_headers {
+    use http::header::{HeaderName, CONNECTION, TRANSFER_ENCODING, UPGRADE};
+    use http::HeaderMap;
+
+    // List of connection headers from RFC 9110 Section 7.6.1
+    //
+    // TE headers are allowed in requests as long as the value is "trailers", so they're
+    // tested separately.
+    static CONNECTION_HEADERS: [HeaderName; 4] = [
+        HeaderName::from_static("keep-alive"),
+        HeaderName::from_static("proxy-connection"),
+        TRANSFER_ENCODING,
+        UPGRADE,
+    ];
+
+    pub(crate) enum MessageKind {
+        #[cfg(feature = "client")]
+        Request,
+        #[cfg(feature = "server")]
+        Response,
+    }
+
+    pub(crate) fn strip_connection_headers(headers: &mut HeaderMap, kind: MessageKind) {
+        for header in &CONNECTION_HEADERS {
+            if headers.remove(header).is_some() {
+                warn!("Connection header illegal in HTTP/2+: {}", header.as_str());
+            }
+        }
+
+        #[cfg(not(feature = "client"))]
+        let _ = kind;
+        #[cfg(feature = "client")]
+        if matches!(kind, MessageKind::Request) {
+            if headers
+                .get(http::header::TE)
+                .map_or(false, |te_header| te_header != "trailers")
+            {
+                warn!("TE headers not set to \"trailers\" are illegal in HTTP/2+ requests");
+                headers.remove(http::header::TE);
+            }
+        } else if headers.remove(http::header::TE).is_some() {
+            warn!("TE headers illegal in HTTP/2+ responses");
+        }
+
+        if let Some(header) = headers.remove(CONNECTION) {
+            warn!(
+                "Connection header illegal in HTTP/2+: {}",
+                CONNECTION.as_str()
+            );
+            // A `Connection` header may have a comma-separated list of names of other headers that
+            // are meant for only this specific connection.
+            //
+            // Iterate these names and remove them as headers. Connection-specific headers are
+            // forbidden in HTTP/2 and HTTP/3, as that information has been moved into frame types
+            // of the respective protocol.
+            if let Ok(header_contents) = header.to_str() {
+                for name in header_contents.split(',') {
+                    let name = name.trim();
+                    headers.remove(name);
+                }
+            }
+        }
+    }
+}
 
 /// An Incoming Message head. Includes request/status line, and headers.
 #[cfg(feature = "http1")]
@@ -55,6 +130,7 @@ pub(crate) enum BodyLength {
 }
 
 /// Status of when a Dispatcher future completes.
+#[cfg(any(feature = "http1", feature = "http2"))]
 pub(crate) enum Dispatched {
     /// Dispatcher completely shutdown connection.
     Shutdown,

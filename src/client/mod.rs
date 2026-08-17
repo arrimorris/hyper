@@ -15,7 +15,11 @@
 mod tests;
 
 cfg_feature! {
-    #![any(feature = "http1", feature = "http2")]
+    #![any(
+        feature = "http1",
+        feature = "http2",
+        all(feature = "http3", hyper_unstable_quic)
+    )]
 
     pub mod conn;
     pub(super) mod dispatch;

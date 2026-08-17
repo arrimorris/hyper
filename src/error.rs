@@ -52,7 +52,8 @@ pub(super) enum Kind {
     /// Indicates a channel (client or body sender) is closed.
     #[cfg(any(
         all(feature = "http1", any(feature = "client", feature = "server")),
-        all(feature = "http2", feature = "client")
+        all(feature = "http2", feature = "client"),
+        all(feature = "http3", hyper_unstable_quic, feature = "client")
     ))]
     ChannelClosed,
     /// An `io::Error` that occurred while trying to read or write to a network stream.
@@ -83,6 +84,14 @@ pub(super) enum Kind {
     /// A general error from h2.
     #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
     Http2,
+
+    /// A general error from h3.
+    #[cfg(all(
+        any(feature = "client", feature = "server"),
+        feature = "http3",
+        hyper_unstable_quic
+    ))]
+    Http3,
 }
 
 #[derive(Debug)]
@@ -97,8 +106,15 @@ pub(super) enum Parse {
     UriTooLong,
     #[cfg(feature = "http1")]
     Header(Header),
-    #[cfg(any(feature = "http1", feature = "http2"))]
-    #[cfg_attr(feature = "http2", allow(unused))]
+    #[cfg(any(
+        feature = "http1",
+        feature = "http2",
+        all(feature = "http3", hyper_unstable_quic)
+    ))]
+    #[cfg_attr(
+        any(feature = "http2", all(feature = "http3", hyper_unstable_quic)),
+        allow(unused)
+    )]
     TooLarge,
     Status,
     #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
@@ -122,7 +138,11 @@ pub(super) enum User {
     /// Error calling the user's `Body::poll_data()`.
     #[cfg(all(
         any(feature = "client", feature = "server"),
-        any(feature = "http1", feature = "http2")
+        any(
+            feature = "http1",
+            feature = "http2",
+            all(feature = "http3", hyper_unstable_quic)
+        )
     ))]
     Body,
     /// The user aborted writing of the outgoing body.
@@ -137,7 +157,8 @@ pub(super) enum User {
     /// Error from future of user's Service.
     #[cfg(any(
         all(any(feature = "client", feature = "server"), feature = "http1"),
-        all(feature = "server", feature = "http2")
+        all(feature = "server", feature = "http2"),
+        all(feature = "server", feature = "http3", hyper_unstable_quic)
     ))]
     Service,
     /// User tried to send a certain header in an unexpected context.
@@ -159,7 +180,14 @@ pub(super) enum User {
     ManualUpgrade,
 
     /// The dispatch task is gone.
-    #[cfg(all(feature = "client", any(feature = "http1", feature = "http2")))]
+    #[cfg(all(
+        feature = "client",
+        any(
+            feature = "http1",
+            feature = "http2",
+            all(feature = "http3", hyper_unstable_quic)
+        )
+    ))]
     DispatchGone,
 
     /// User aborted in an FFI callback.
@@ -392,7 +420,8 @@ impl Error {
 
     #[cfg(any(
         all(feature = "http1", any(feature = "client", feature = "server")),
-        all(feature = "http2", feature = "client")
+        all(feature = "http2", feature = "client"),
+        all(feature = "http3", hyper_unstable_quic, feature = "client")
     ))]
     pub(super) fn new_closed() -> Error {
         Error::new(Kind::ChannelClosed)
@@ -454,7 +483,8 @@ impl Error {
 
     #[cfg(any(
         all(any(feature = "client", feature = "server"), feature = "http1"),
-        all(feature = "server", feature = "http2")
+        all(feature = "server", feature = "http2"),
+        all(feature = "server", feature = "http3", hyper_unstable_quic)
     ))]
     pub(super) fn new_user_service<E: Into<Cause>>(cause: E) -> Error {
         Error::new_user(User::Service).with(cause)
@@ -462,7 +492,11 @@ impl Error {
 
     #[cfg(all(
         any(feature = "client", feature = "server"),
-        any(feature = "http1", feature = "http2")
+        any(
+            feature = "http1",
+            feature = "http2",
+            all(feature = "http3", hyper_unstable_quic)
+        )
     ))]
     pub(super) fn new_user_body<E: Into<Cause>>(cause: E) -> Error {
         Error::new_user(User::Body).with(cause)
@@ -483,7 +517,14 @@ impl Error {
         Error::new_user(User::AbortedByCallback)
     }
 
-    #[cfg(all(feature = "client", any(feature = "http1", feature = "http2")))]
+    #[cfg(all(
+        feature = "client",
+        any(
+            feature = "http1",
+            feature = "http2",
+            all(feature = "http3", hyper_unstable_quic)
+        )
+    ))]
     pub(super) fn new_user_dispatch_gone() -> Error {
         Error::new(Kind::User(User::DispatchGone))
     }
@@ -495,6 +536,29 @@ impl Error {
         } else {
             Error::new(Kind::Http2).with(cause)
         }
+    }
+
+    /// An HTTP/3 connection failed.
+    ///
+    /// A clean `H3_NO_ERROR` shutdown is not an error, and callers are expected
+    /// to filter it out before reaching here.
+    #[cfg(all(
+        any(feature = "client", feature = "server"),
+        feature = "http3",
+        hyper_unstable_quic
+    ))]
+    pub(super) fn new_h3(cause: h3::error::ConnectionError) -> Error {
+        Error::new(Kind::Http3).with(cause)
+    }
+
+    /// A single HTTP/3 stream failed, without taking the connection with it.
+    #[cfg(all(
+        any(feature = "client", feature = "server"),
+        feature = "http3",
+        hyper_unstable_quic
+    ))]
+    pub(super) fn new_h3_stream(cause: h3::error::StreamError) -> Error {
+        Error::new(Kind::Http3).with(cause)
     }
 
     fn description(&self) -> &str {
@@ -521,7 +585,11 @@ impl Error {
             Kind::Parse(Parse::Header(Header::TransferEncodingUnexpected)) => {
                 "unexpected transfer-encoding parsed"
             }
-            #[cfg(any(feature = "http1", feature = "http2"))]
+            #[cfg(any(
+                feature = "http1",
+                feature = "http2",
+                all(feature = "http3", hyper_unstable_quic)
+            ))]
             Kind::Parse(Parse::TooLarge) => "message head is too large",
             Kind::Parse(Parse::Status) => "invalid HTTP status-code parsed",
             #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
@@ -534,7 +602,8 @@ impl Error {
             Kind::UnexpectedMessage => "received unexpected message from connection",
             #[cfg(any(
                 all(feature = "http1", any(feature = "client", feature = "server")),
-                all(feature = "http2", feature = "client")
+                all(feature = "http2", feature = "client"),
+                all(feature = "http3", hyper_unstable_quic, feature = "client")
             ))]
             Kind::ChannelClosed => "channel closed",
             Kind::Canceled => "operation was canceled",
@@ -556,13 +625,23 @@ impl Error {
             Kind::Http2 => "http2 error",
             #[cfg(all(
                 any(feature = "client", feature = "server"),
+                feature = "http3",
+                hyper_unstable_quic
+            ))]
+            Kind::Http3 => "http3 error",
+            #[cfg(all(
+                any(feature = "client", feature = "server"),
                 any(feature = "http1", feature = "http2")
             ))]
             Kind::Io => "connection error",
 
             #[cfg(all(
                 any(feature = "client", feature = "server"),
-                any(feature = "http1", feature = "http2")
+                any(
+                    feature = "http1",
+                    feature = "http2",
+                    all(feature = "http3", hyper_unstable_quic)
+                )
             ))]
             Kind::User(User::Body) => "error from user's Body stream",
             #[cfg(any(
@@ -576,7 +655,8 @@ impl Error {
             }
             #[cfg(any(
                 all(any(feature = "client", feature = "server"), feature = "http1"),
-                all(feature = "server", feature = "http2")
+                all(feature = "server", feature = "http2"),
+                all(feature = "server", feature = "http3", hyper_unstable_quic)
             ))]
             Kind::User(User::Service) => "error from user's Service",
             #[cfg(any(feature = "http1", feature = "http2"))]
@@ -590,7 +670,14 @@ impl Error {
             Kind::User(User::NoUpgrade) => "no upgrade available",
             #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
             Kind::User(User::ManualUpgrade) => "upgrade expected but low level API in use",
-            #[cfg(all(feature = "client", any(feature = "http1", feature = "http2")))]
+            #[cfg(all(
+                feature = "client",
+                any(
+                    feature = "http1",
+                    feature = "http2",
+                    all(feature = "http3", hyper_unstable_quic)
+                )
+            ))]
             Kind::User(User::DispatchGone) => "dispatch task is gone",
             #[cfg(feature = "ffi")]
             Kind::User(User::AbortedByCallback) => "operation aborted by an application callback",

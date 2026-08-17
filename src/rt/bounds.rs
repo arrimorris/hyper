@@ -7,6 +7,10 @@
 pub use self::h2_client::Http2ClientConnExec;
 #[cfg(all(feature = "server", feature = "http2"))]
 pub use self::h2_server::Http2ServerConnExec;
+#[cfg(all(feature = "client", feature = "http3", hyper_unstable_quic))]
+pub use self::h3_client::Http3ClientConnExec;
+#[cfg(all(feature = "server", feature = "http3", hyper_unstable_quic))]
+pub use self::h3_server::Http3ServerConnExec;
 
 #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
 pub(crate) use self::h2_common::Http2UpgradedExec;
@@ -139,5 +143,91 @@ mod h2_server {
 
     mod sealed {
         pub trait Sealed<T> {}
+    }
+}
+
+#[cfg(all(feature = "server", feature = "http3", hyper_unstable_quic))]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(all(feature = "server", feature = "http3", hyper_unstable_quic)))
+)]
+mod h3_server {
+    use crate::proto::h3::server::H3Stream;
+    use crate::rt::Executor;
+
+    /// An executor to spawn HTTP/3 request tasks.
+    ///
+    /// Unlike HTTP/1 and HTTP/2, an HTTP/3 connection *must* have an executor:
+    /// QUIC streams are independent, so each request is driven as its own task
+    /// rather than in lockstep with the connection.
+    ///
+    /// This trait is implemented for any type that implements the [`Executor`]
+    /// trait for any future.
+    ///
+    /// This trait is sealed and cannot be implemented for types outside this crate.
+    ///
+    /// [`Executor`]: crate::rt::Executor
+    pub trait Http3ServerConnExec: sealed::Sealed + Clone {
+        #[doc(hidden)]
+        fn execute_h3stream(&mut self, fut: H3Stream);
+    }
+
+    #[doc(hidden)]
+    impl<E> Http3ServerConnExec for E
+    where
+        E: Clone + Executor<H3Stream>,
+    {
+        fn execute_h3stream(&mut self, fut: H3Stream) {
+            self.execute(fut);
+        }
+    }
+
+    impl<E> sealed::Sealed for E where E: Clone + Executor<H3Stream> {}
+
+    mod sealed {
+        pub trait Sealed {}
+    }
+}
+
+#[cfg(all(feature = "client", feature = "http3", hyper_unstable_quic))]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(all(feature = "client", feature = "http3", hyper_unstable_quic)))
+)]
+mod h3_client {
+    use crate::proto::h3::client::H3ClientFuture;
+    use crate::rt::Executor;
+
+    /// An executor to spawn HTTP/3 request tasks for the client.
+    ///
+    /// Unlike HTTP/1 and HTTP/2, an HTTP/3 connection *must* have an executor:
+    /// QUIC streams are independent, so each request is driven as its own task
+    /// rather than in lockstep with the connection.
+    ///
+    /// This trait is implemented for any type that implements the [`Executor`]
+    /// trait for any future.
+    ///
+    /// This trait is sealed and cannot be implemented for types outside this crate.
+    ///
+    /// [`Executor`]: crate::rt::Executor
+    pub trait Http3ClientConnExec: sealed::Sealed + Clone {
+        #[doc(hidden)]
+        fn execute_h3_future(&mut self, fut: H3ClientFuture);
+    }
+
+    #[doc(hidden)]
+    impl<E> Http3ClientConnExec for E
+    where
+        E: Clone + Executor<H3ClientFuture>,
+    {
+        fn execute_h3_future(&mut self, fut: H3ClientFuture) {
+            self.execute(fut);
+        }
+    }
+
+    impl<E> sealed::Sealed for E where E: Clone + Executor<H3ClientFuture> {}
+
+    mod sealed {
+        pub trait Sealed {}
     }
 }

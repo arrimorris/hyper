@@ -64,7 +64,7 @@ pub(crate) struct Sender<T, U> {
 ///
 /// Cannot poll the Giver, but can still use it to determine if the Receiver
 /// has been dropped. However, this version can be cloned.
-#[cfg(feature = "http2")]
+#[cfg(any(feature = "http2", all(feature = "http3", hyper_unstable_quic)))]
 pub(crate) struct UnboundedSender<T, U> {
     /// Only used for `is_closed`, since `mpsc::UnboundedSender` cannot be checked.
     giver: want::SharedGiver,
@@ -127,7 +127,7 @@ impl<T, U> Sender<T, U> {
             .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
     }
 
-    #[cfg(feature = "http2")]
+    #[cfg(any(feature = "http2", all(feature = "http3", hyper_unstable_quic)))]
     pub(crate) fn unbound(self) -> UnboundedSender<T, U> {
         UnboundedSender {
             giver: self.giver.shared(),
@@ -136,7 +136,7 @@ impl<T, U> Sender<T, U> {
     }
 }
 
-#[cfg(feature = "http2")]
+#[cfg(any(feature = "http2", all(feature = "http3", hyper_unstable_quic)))]
 impl<T, U> UnboundedSender<T, U> {
     pub(crate) fn is_ready(&self) -> bool {
         !self.giver.is_canceled()
@@ -163,7 +163,7 @@ impl<T, U> UnboundedSender<T, U> {
     }
 }
 
-#[cfg(feature = "http2")]
+#[cfg(any(feature = "http2", all(feature = "http3", hyper_unstable_quic)))]
 impl<T, U> Clone for UnboundedSender<T, U> {
     fn clone(&self) -> Self {
         UnboundedSender {
@@ -273,6 +273,7 @@ impl<T, U> Callback<T, U> {
         }
     }
 
+    #[cfg(any(feature = "http1", feature = "http2"))]
     pub(crate) fn poll_canceled(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         match self {
             Callback::Retry(Some(tx)) => tx.poll_closed(cx),

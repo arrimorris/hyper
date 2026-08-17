@@ -18,5 +18,8 @@
 pub mod http1;
 #[cfg(feature = "http2")]
 pub mod http2;
+cfg_http3! {
+    pub mod http3;
+}
 
 pub use super::dispatch::TrySendError;

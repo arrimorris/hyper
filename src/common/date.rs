@@ -3,7 +3,7 @@ use std::fmt::{self, Write};
 use std::str;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[cfg(feature = "http2")]
+#[cfg(any(feature = "http2", all(feature = "http3", hyper_unstable_quic)))]
 use http::header::HeaderValue;
 use httpdate::HttpDate;
 
@@ -24,7 +24,7 @@ pub(crate) fn update() {
     });
 }
 
-#[cfg(feature = "http2")]
+#[cfg(any(feature = "http2", all(feature = "http3", hyper_unstable_quic)))]
 pub(crate) fn update_and_header_value() -> HeaderValue {
     CACHED.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -36,7 +36,7 @@ pub(crate) fn update_and_header_value() -> HeaderValue {
 struct CachedDate {
     bytes: [u8; DATE_VALUE_LENGTH],
     pos: usize,
-    #[cfg(feature = "http2")]
+    #[cfg(any(feature = "http2", all(feature = "http3", hyper_unstable_quic)))]
     header_value: HeaderValue,
     next_update: SystemTime,
 }
@@ -48,7 +48,7 @@ impl CachedDate {
         let mut cache = CachedDate {
             bytes: [0; DATE_VALUE_LENGTH],
             pos: 0,
-            #[cfg(feature = "http2")]
+            #[cfg(any(feature = "http2", all(feature = "http3", hyper_unstable_quic)))]
             header_value: HeaderValue::from_static(""),
             next_update: SystemTime::now(),
         };
@@ -84,13 +84,13 @@ impl CachedDate {
         self.render_http2();
     }
 
-    #[cfg(feature = "http2")]
+    #[cfg(any(feature = "http2", all(feature = "http3", hyper_unstable_quic)))]
     fn render_http2(&mut self) {
         self.header_value = HeaderValue::from_bytes(self.buffer())
             .expect("Date format should be valid HeaderValue");
     }
 
-    #[cfg(not(feature = "http2"))]
+    #[cfg(not(any(feature = "http2", all(feature = "http3", hyper_unstable_quic))))]
     fn render_http2(&mut self) {}
 }
 

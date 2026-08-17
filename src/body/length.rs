@@ -3,7 +3,11 @@ use std::fmt;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DecodedLength(u64);
 
-#[cfg(any(feature = "http1", feature = "http2"))]
+#[cfg(any(
+    feature = "http1",
+    feature = "http2",
+    all(feature = "http3", hyper_unstable_quic)
+))]
 impl From<Option<u64>> for DecodedLength {
     fn from(len: Option<u64>) -> Self {
         len.and_then(|len| {
@@ -14,7 +18,12 @@ impl From<Option<u64>> for DecodedLength {
     }
 }
 
-#[cfg(any(feature = "http1", feature = "http2", test))]
+#[cfg(any(
+    feature = "http1",
+    feature = "http2",
+    all(feature = "http3", hyper_unstable_quic),
+    test
+))]
 const MAX_LEN: u64 = u64::MAX - 2;
 
 impl DecodedLength {
@@ -41,7 +50,11 @@ impl DecodedLength {
 
     /// Converts to an Option<u64> representing a Known or Unknown length.
     #[cfg(all(
-        any(feature = "http1", feature = "http2"),
+        any(
+            feature = "http1",
+            feature = "http2",
+            all(feature = "http3", hyper_unstable_quic)
+        ),
         any(feature = "client", feature = "server")
     ))]
     pub(crate) fn into_opt(self) -> Option<u64> {
@@ -52,7 +65,11 @@ impl DecodedLength {
     }
 
     /// Checks the `u64` is within the maximum allowed for content-length.
-    #[cfg(any(feature = "http1", feature = "http2"))]
+    #[cfg(any(
+        feature = "http1",
+        feature = "http2",
+        all(feature = "http3", hyper_unstable_quic)
+    ))]
     pub(crate) fn checked_new(len: u64) -> Result<Self, crate::error::Parse> {
         if len <= MAX_LEN {
             Ok(DecodedLength(len))
@@ -63,7 +80,11 @@ impl DecodedLength {
     }
 
     #[cfg(all(
-        any(feature = "http1", feature = "http2"),
+        any(
+            feature = "http1",
+            feature = "http2",
+            all(feature = "http3", hyper_unstable_quic)
+        ),
         any(feature = "client", feature = "server")
     ))]
     pub(crate) fn sub_if(&mut self, amt: u64) {

@@ -7,8 +7,6 @@ use std::task::{Context, Poll};
 use bytes::Buf;
 use futures_core::ready;
 use h2::SendStream;
-use http::header::{HeaderName, CONNECTION, TRANSFER_ENCODING, UPGRADE};
-use http::HeaderMap;
 use pin_project_lite::pin_project;
 
 use crate::body::Body;
@@ -28,66 +26,6 @@ cfg_server! {
 
 /// Default initial stream window size defined in HTTP2 spec.
 pub(crate) const SPEC_WINDOW_SIZE: u32 = 65_535;
-
-// List of connection headers from RFC 9110 Section 7.6.1
-//
-// TE headers are allowed in HTTP/2 requests as long as the value is "trailers", so they're
-// tested separately.
-static CONNECTION_HEADERS: [HeaderName; 4] = [
-    HeaderName::from_static("keep-alive"),
-    HeaderName::from_static("proxy-connection"),
-    TRANSFER_ENCODING,
-    UPGRADE,
-];
-
-enum MessageKind {
-    #[cfg(feature = "client")]
-    Request,
-    #[cfg(feature = "server")]
-    Response,
-}
-
-fn strip_connection_headers(headers: &mut HeaderMap, kind: MessageKind) {
-    for header in &CONNECTION_HEADERS {
-        if headers.remove(header).is_some() {
-            warn!("Connection header illegal in HTTP/2: {}", header.as_str());
-        }
-    }
-
-    #[cfg(not(feature = "client"))]
-    let _ = kind;
-    #[cfg(feature = "client")]
-    if matches!(kind, MessageKind::Request) {
-        if headers
-            .get(http::header::TE)
-            .map_or(false, |te_header| te_header != "trailers")
-        {
-            warn!("TE headers not set to \"trailers\" are illegal in HTTP/2 requests");
-            headers.remove(http::header::TE);
-        }
-    } else if headers.remove(http::header::TE).is_some() {
-        warn!("TE headers illegal in HTTP/2 responses");
-    }
-
-    if let Some(header) = headers.remove(CONNECTION) {
-        warn!(
-            "Connection header illegal in HTTP/2: {}",
-            CONNECTION.as_str()
-        );
-        // A `Connection` header may have a comma-separated list of names of other headers that
-        // are meant for only this specific connection.
-        //
-        // Iterate these names and remove them as headers. Connection-specific headers are
-        // forbidden in HTTP2, as that information has been moved into frame types of the h2
-        // protocol.
-        if let Ok(header_contents) = header.to_str() {
-            for name in header_contents.split(',') {
-                let name = name.trim();
-                headers.remove(name);
-            }
-        }
-    }
-}
 
 // body adapters used by both Client and Server
 

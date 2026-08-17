@@ -1,9 +1,16 @@
 #[cfg(all(feature = "client", feature = "http1"))]
 use bytes::BytesMut;
 use http::header::HeaderValue;
-#[cfg(all(feature = "http2", feature = "client"))]
+#[cfg(all(
+    any(feature = "http2", all(feature = "http3", hyper_unstable_quic)),
+    feature = "client"
+))]
 use http::Method;
-#[cfg(any(feature = "client", all(feature = "server", feature = "http2")))]
+#[cfg(any(
+    feature = "client",
+    all(feature = "server", feature = "http2"),
+    all(feature = "server", feature = "http3", hyper_unstable_quic)
+))]
 use http::{
     header::{ValueIter, CONTENT_LENGTH},
     HeaderMap,
@@ -67,12 +74,20 @@ pub(super) fn content_length_parse(value: &HeaderValue) -> Option<u64> {
     from_digits(value.as_bytes())
 }
 
-#[cfg(any(feature = "client", all(feature = "server", feature = "http2")))]
+#[cfg(any(
+    feature = "client",
+    all(feature = "server", feature = "http2"),
+    all(feature = "server", feature = "http3", hyper_unstable_quic)
+))]
 pub(super) fn content_length_parse_all(headers: &HeaderMap) -> Option<u64> {
     content_length_parse_all_values(headers.get_all(CONTENT_LENGTH).into_iter())
 }
 
-#[cfg(any(feature = "client", all(feature = "server", feature = "http2")))]
+#[cfg(any(
+    feature = "client",
+    all(feature = "server", feature = "http2"),
+    all(feature = "server", feature = "http3", hyper_unstable_quic)
+))]
 pub(super) fn content_length_parse_all_values(values: ValueIter<'_, HeaderValue>) -> Option<u64> {
     // If multiple Content-Length headers were sent, everything can still
     // be alright if they all contain the same value, and all parse
@@ -125,7 +140,10 @@ fn from_digits(bytes: &[u8]) -> Option<u64> {
     Some(result)
 }
 
-#[cfg(all(feature = "http2", feature = "client"))]
+#[cfg(all(
+    any(feature = "http2", all(feature = "http3", hyper_unstable_quic)),
+    feature = "client"
+))]
 pub(super) fn method_has_defined_payload_semantics(method: &Method) -> bool {
     !matches!(
         *method,
@@ -133,7 +151,10 @@ pub(super) fn method_has_defined_payload_semantics(method: &Method) -> bool {
     )
 }
 
-#[cfg(feature = "http2")]
+#[cfg(any(
+    feature = "http2",
+    all(feature = "http3", hyper_unstable_quic, feature = "client")
+))]
 pub(super) fn set_content_length_if_missing(headers: &mut HeaderMap, len: u64) {
     headers
         .entry(CONTENT_LENGTH)

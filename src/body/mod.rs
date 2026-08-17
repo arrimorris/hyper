@@ -74,14 +74,22 @@ pub use self::incoming::Incoming;
 #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
 pub(crate) use self::incoming::Sender;
 #[cfg(all(
-    any(feature = "http1", feature = "http2"),
+    any(
+        feature = "http1",
+        feature = "http2",
+        all(feature = "http3", hyper_unstable_quic)
+    ),
     any(feature = "client", feature = "server")
 ))]
 pub(crate) use self::length::DecodedLength;
 
 mod incoming;
 #[cfg(all(
-    any(feature = "http1", feature = "http2"),
+    any(
+        feature = "http1",
+        feature = "http2",
+        all(feature = "http3", hyper_unstable_quic)
+    ),
     any(feature = "client", feature = "server")
 ))]
 mod length;
