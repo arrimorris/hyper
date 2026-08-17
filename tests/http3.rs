@@ -443,6 +443,61 @@ async fn graceful_shutdown_finishes_inflight_request() {
         .expect("graceful shutdown is not an error");
 }
 
+/// Dropping the future returned by `send_request` is how hyper cancels an
+/// in-flight request. On HTTP/3 that must reset this one QUIC stream — the
+/// peer should find out, rather than keep working on a request nobody wants.
+#[tokio::test]
+async fn dropping_the_request_future_resets_the_stream() {
+    let tls = tls();
+    let (result_tx, result_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let addr = spawn_server(
+        &tls,
+        service_fn(move |req: Request<Incoming>| {
+            let result_tx = result_tx.clone();
+            async move {
+                // Never responds; just reads until the client goes away.
+                let outcome = req.into_body().collect().await;
+                let _ = result_tx.send(outcome.is_err());
+                Ok::<_, Infallible>(Response::new(full("unreachable")))
+            }
+        }),
+    );
+
+    let (_endpoint, mut send_request) = connect(&tls, addr).await;
+
+    // A body that never ends, so the server stays in `collect()`.
+    let never_ending = futures_util::stream::unfold((), |()| async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Some((
+            Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"tick"))),
+            (),
+        ))
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("https://localhost/abandoned")
+        .body(StreamBody::new(never_ending).boxed())
+        .unwrap();
+
+    let pending = send_request.send_request(req);
+    // Let it reach the server, then give up on it.
+    let timed_out = tokio::time::timeout(Duration::from_millis(300), pending).await;
+    assert!(timed_out.is_err(), "the server never responds");
+    // `timed_out` being an error means the future was dropped: cancelled.
+
+    let mut result_rx = result_rx;
+    let saw_reset = tokio::time::timeout(Duration::from_secs(10), result_rx.recv())
+        .await
+        .expect("the server must notice the cancellation")
+        .expect("channel open");
+
+    assert!(
+        saw_reset,
+        "the server's read of the request body should fail once the client cancels"
+    );
+}
+
 // ===== being mean to the connection =====
 
 /// Wi-Fi to cellular, mid-request.

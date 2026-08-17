@@ -215,7 +215,7 @@ impl std::fmt::Debug for H3ClientFuture {
 async fn exchange<O, B, E>(
     mut send_request: h3::client::SendRequest<O, B::Data>,
     req: Request<B>,
-    cb: Callback<Request<B>, Response<IncomingBody>>,
+    mut cb: Callback<Request<B>, Response<IncomingBody>>,
     mut exec: E,
 ) where
     O: h3::quic::OpenStreams<B::Data> + Clone + Send + 'static,
@@ -255,24 +255,72 @@ async fn exchange<O, B, E>(
     // heard immediately instead of after the whole body has gone out.
     let (mut send, mut recv) = stream.split();
 
+    // Lets this task tell the upload to stop if the caller gives up. Sending
+    // means "cancelled"; the sender simply being dropped means this task
+    // finished normally and the upload should carry on.
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
     exec.execute_h3_future(H3ClientFuture::new(async move {
-        if let Err(_err) = send_body(&mut send, body).await {
-            debug!("http3 error sending request body: {}", _err);
-            send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
-            return;
-        }
-        if let Err(_err) = send.finish().await {
-            debug!("http3 error finishing request: {}", _err);
+        let outcome = {
+            let mut pump = std::pin::pin!(send_body(&mut send, body));
+            let mut cancel = cancel_rx;
+            let mut watching = true;
+            poll_fn(|cx| {
+                if watching {
+                    match Pin::new(&mut cancel).poll(cx) {
+                        Poll::Ready(Ok(())) => return Poll::Ready(Upload::Cancelled),
+                        // The request task is done with us; keep uploading.
+                        Poll::Ready(Err(_)) => watching = false,
+                        Poll::Pending => {}
+                    }
+                }
+                pump.as_mut().poll(cx).map(Upload::Finished)
+            })
+            .await
+        };
+
+        match outcome {
+            Upload::Cancelled => send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED),
+            Upload::Finished(Err(_err)) => {
+                debug!("http3 error sending request body: {}", _err);
+                send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+            }
+            Upload::Finished(Ok(())) => {
+                if let Err(_err) = send.finish().await {
+                    debug!("http3 error finishing request: {}", _err);
+                }
+            }
         }
     }));
 
-    let head = match recv.recv_response().await {
-        Ok(res) => res,
-        Err(err) => {
+    // Wait for the response head, but give up the moment the caller drops the
+    // future it is waiting on. Dropping an in-flight request is how hyper
+    // cancels one, and on HTTP/3 — as on HTTP/2 — that must reset this single
+    // stream rather than leaving the peer streaming a response into the void.
+    let received = {
+        let mut response = std::pin::pin!(recv.recv_response());
+        poll_fn(|cx| {
+            if cb.poll_canceled(cx).is_ready() {
+                return Poll::Ready(None);
+            }
+            response.as_mut().poll(cx).map(Some)
+        })
+        .await
+    };
+
+    let head = match received {
+        Some(Ok(head)) => head,
+        Some(Err(err)) => {
             cb.send(Err(TrySendError {
                 error: crate::Error::new_h3_stream(err),
                 message: None,
             }));
+            return;
+        }
+        None => {
+            trace!("http3 request canceled by caller");
+            let _ = cancel_tx.send(());
+            recv.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
             return;
         }
     };
@@ -283,6 +331,13 @@ async fn exchange<O, B, E>(
     *res.version_mut() = Version::HTTP_3;
 
     cb.send(Ok(res));
+}
+
+/// How the request-body upload ended.
+enum Upload {
+    /// The caller dropped the request before the response arrived.
+    Cancelled,
+    Finished(crate::Result<()>),
 }
 
 /// Pump a request body onto a request stream.

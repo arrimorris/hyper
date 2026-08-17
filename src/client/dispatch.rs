@@ -273,7 +273,11 @@ impl<T, U> Callback<T, U> {
         }
     }
 
-    #[cfg(any(feature = "http1", feature = "http2"))]
+    #[cfg(any(
+        feature = "http1",
+        feature = "http2",
+        all(feature = "http3", hyper_unstable_quic, feature = "client")
+    ))]
     pub(crate) fn poll_canceled(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         match self {
             Callback::Retry(Some(tx)) => tx.poll_closed(cx),

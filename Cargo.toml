@@ -77,9 +77,9 @@ tokio-util = "0.7.10"
 
 # Used only by the `http3` tests and examples, which drive `hyper::rt::quic`
 # with a real QUIC stack. hyper itself never depends on a QUIC implementation.
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
-rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std"] }
-rcgen = "0.13"
+quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+rustls = { version = "0.23.5", default-features = false, features = ["logging", "ring", "std"] }
+rcgen = "0.13.2"
 
 [features]
 # Nothing by default
@@ -222,6 +222,11 @@ type_complexity = "allow" # not helpful
 used_underscore_items = "allow"
 unnecessary_safety_comment = "allow" # more safety comments are a good thing
 unseparated_literal_suffix = "allow" # i don't like 0_u8 (do i?)
+
+# The QUIC stack is only reachable from targets that require the `http3`
+# feature, so every other build looks like it does not use these.
+[package.metadata.cargo-udeps.ignore]
+development = ["quinn", "rustls", "rcgen"]
 
 [package.metadata.docs.rs]
 features = ["ffi", "full", "http3", "tracing"]
