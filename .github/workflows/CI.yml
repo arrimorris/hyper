@@ -230,6 +230,14 @@ jobs:
           cargo check --features http3,server --example http3_server
           cargo check --features http3,client --example http3_client
 
+      # The `doc` job covers http3 too, but on a different toolchain and with
+      # different flags; catch broken links here as well.
+      # `RUSTFLAGS` does not reach rustdoc, so the cfg is passed through
+      # explicitly, the same way the `doc` job does it. `full` is included
+      # because some of hyper's existing docs link to http1-only items.
+      - name: Docs
+        run: cargo rustdoc --features full,http3 -- --cfg hyper_unstable_quic -D rustdoc::broken-intra-doc-links
+
   ffi:
     name: Test C API (FFI)
     needs: [style]

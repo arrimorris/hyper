@@ -104,7 +104,11 @@ impl<B: Buf> quic::Connection<B> for Connection {
         let (send, recv) = match self.incoming_bi.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(pair))) => pair,
             Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(conn_error(err))),
-            Poll::Ready(None) => unreachable!("the accept stream never ends"),
+            Poll::Ready(None) => {
+                return Poll::Ready(Err(quic::ConnectionError::Internal(
+                    "quinn accept stream ended".to_owned(),
+                )))
+            }
             Poll::Pending => return Poll::Pending,
         };
         Poll::Ready(Ok(BidiStream {
@@ -120,7 +124,11 @@ impl<B: Buf> quic::Connection<B> for Connection {
         let recv = match self.incoming_uni.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(recv))) => recv,
             Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(conn_error(err))),
-            Poll::Ready(None) => unreachable!("the accept stream never ends"),
+            Poll::Ready(None) => {
+                return Poll::Ready(Err(quic::ConnectionError::Internal(
+                    "quinn accept stream ended".to_owned(),
+                )))
+            }
             Poll::Pending => return Poll::Pending,
         };
         Poll::Ready(Ok(RecvStream::new(recv)))
@@ -221,7 +229,11 @@ fn poll_open_bi<B: Buf>(
         Poll::Ready(Some(Err(err))) => {
             return Poll::Ready(Err(quic::StreamError::Connection(conn_error(err))))
         }
-        Poll::Ready(None) => unreachable!("the open stream never ends"),
+        Poll::Ready(None) => {
+            return Poll::Ready(Err(quic::StreamError::Connection(
+                quic::ConnectionError::Internal("quinn open stream ended".to_owned()),
+            )))
+        }
         Poll::Pending => return Poll::Pending,
     };
     Poll::Ready(Ok(BidiStream {
@@ -245,7 +257,11 @@ fn poll_open_uni<B: Buf>(
         Poll::Ready(Some(Err(err))) => {
             return Poll::Ready(Err(quic::StreamError::Connection(conn_error(err))))
         }
-        Poll::Ready(None) => unreachable!("the open stream never ends"),
+        Poll::Ready(None) => {
+            return Poll::Ready(Err(quic::StreamError::Connection(
+                quic::ConnectionError::Internal("quinn open stream ended".to_owned()),
+            )))
+        }
         Poll::Pending => return Poll::Pending,
     };
     Poll::Ready(Ok(SendStream::new(send)))
@@ -356,7 +372,19 @@ impl<B: Buf> quic::SendStream<B> for SendStream<B> {
         Ok(())
     }
 
-    fn poll_finish(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), quic::StreamError>> {
+    fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), quic::StreamError>> {
+        // Flush whatever `send_data` queued before signalling the FIN. quinn
+        // finishes the stream at the current write offset, so finishing with
+        // bytes still buffered here would truncate the stream and the peer
+        // would never learn it was short.
+        if self.writing.is_some() {
+            match self.poll_ready(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
         Poll::Ready(match self.stream.finish() {
             Ok(()) => Ok(()),
             // Already finished or reset; either way there is nothing left to do.

@@ -300,6 +300,11 @@ async fn exchange<O, B, E>(
     let received = {
         let mut response = std::pin::pin!(recv.recv_response());
         poll_fn(|cx| {
+            // Cancellation is checked first on purpose. If the caller drops
+            // the future in the same wake-up that the response head lands,
+            // the head is discarded rather than delivered to nobody — the
+            // caller said it no longer wants this. Do not "fix" this by
+            // preferring the response.
             if cb.poll_canceled(cx).is_ready() {
                 return Poll::Ready(None);
             }

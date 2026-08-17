@@ -498,6 +498,46 @@ async fn dropping_the_request_future_resets_the_stream() {
     );
 }
 
+/// A body big enough that the QUIC flow-control window closes part way
+/// through, so the send path really does go `Pending` and resume, and the
+/// stream is finished only once everything queued has been flushed.
+#[tokio::test]
+async fn large_response_body_survives_flow_control() {
+    const LEN: usize = 4 * 1024 * 1024;
+
+    let tls = tls();
+    let addr = spawn_server(
+        &tls,
+        service_fn(|_req: Request<Incoming>| async move {
+            // 64 KiB at a time, so the body is many frames rather than one.
+            let chunks = futures_util::stream::unfold(0usize, |sent| async move {
+                if sent >= LEN {
+                    return None;
+                }
+                let chunk = vec![(sent / 65536) as u8; 65536];
+                Some((
+                    Ok::<_, Infallible>(Frame::data(Bytes::from(chunk))),
+                    sent + 65536,
+                ))
+            });
+            Ok::<_, Infallible>(Response::new(StreamBody::new(chunks).boxed()))
+        }),
+    );
+
+    let (_endpoint, mut send_request) = connect(&tls, addr).await;
+
+    let res = send_request.send_request(get("/big")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.len(), LEN, "the whole body must arrive, not a prefix");
+    // Every 64 KiB block carries its own index, so a dropped or reordered
+    // chunk shows up as a wrong byte rather than just a wrong length.
+    for (i, block) in body.chunks(65536).enumerate() {
+        assert!(block.iter().all(|&b| b == i as u8), "block {i} is corrupt");
+    }
+}
+
 // ===== being mean to the connection =====
 
 /// Wi-Fi to cellular, mid-request.
@@ -570,7 +610,7 @@ async fn survives_network_migration_mid_request() {
 /// Every packet in both directions is dropped for `blackout`, then the network
 /// comes back. Because the idle timeout is five minutes and hyper adds no
 /// timeout of its own, the in-flight request simply resumes.
-async fn blackout_case(blackout: Duration, idle_timeout: Duration) -> crate::BlackoutOutcome {
+async fn blackout_case(blackout: Duration, idle_timeout: Duration) -> BlackoutOutcome {
     let tls = tls_with_idle_timeout(idle_timeout);
     let addr = spawn_server(
         &tls,

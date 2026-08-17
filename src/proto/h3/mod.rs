@@ -157,6 +157,12 @@ macro_rules! recv_body {
                     // usually a handler that ignored the request body. Tell the
                     // peer to stop sending rather than letting it push bytes at
                     // a window nobody will ever drain.
+                    //
+                    // `H3_NO_ERROR` is the code the spec asks for here, not a
+                    // stand-in for a cancellation code: RFC 9114 §4.1 says
+                    // "H3_NO_ERROR SHOULD be used when requesting that the
+                    // client stop sending on the request stream". Nothing went
+                    // wrong; the rest of the body is simply not wanted.
                     self.stream.stop_sending(h3::error::Code::H3_NO_ERROR);
                 }
             }

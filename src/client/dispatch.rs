@@ -276,7 +276,7 @@ impl<T, U> Callback<T, U> {
     #[cfg(any(
         feature = "http1",
         feature = "http2",
-        all(feature = "http3", hyper_unstable_quic, feature = "client")
+        all(feature = "http3", hyper_unstable_quic)
     ))]
     pub(crate) fn poll_canceled(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         match self {

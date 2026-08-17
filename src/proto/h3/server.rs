@@ -274,8 +274,7 @@ where
         let resolver = conn.create_resolver(h3::frame::FrameStream::new(
             h3::stream::BufRecvStream::new(stream),
         ));
-        // h3 only greases the first request on a connection.
-        conn.inner.send_grease_frame = false;
+        suppress_further_grease(conn);
 
         let guard = self.tasks_tx.clone();
         let service = self.service.clone();
@@ -290,6 +289,24 @@ where
 
         Poll::Ready(Ok(true))
     }
+}
+
+/// Send the GREASE frame on the first request of a connection only.
+///
+/// h3 clears this flag itself inside `Connection::accept`, but hyper drives
+/// the poll-based accept path instead, so it has to do the same — otherwise
+/// every request stream would carry a GREASE frame rather than just the first.
+///
+/// This is the one place hyper touches a field of h3's `Connection` rather
+/// than calling a method, and h3 marks that field as a deliberate, temporary
+/// break in its own encapsulation. Written against h3 0.0.8; re-check on any
+/// h3 upgrade, and drop this entirely if h3 grows a way to say it.
+fn suppress_further_grease<C, B>(conn: &mut h3::server::Connection<C, B>)
+where
+    C: h3::quic::Connection<B>,
+    B: Buf,
+{
+    conn.inner.send_grease_frame = false;
 }
 
 /// A connection that ended with `H3_NO_ERROR` ended cleanly.

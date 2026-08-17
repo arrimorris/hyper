@@ -141,6 +141,12 @@ pub trait SendStream<B: Buf> {
     fn send_data(&mut self, data: WriteBuf<B>) -> Result<(), StreamError>;
 
     /// Poll until the sending half has been closed cleanly (a QUIC `FIN`).
+    ///
+    /// Implementations must flush anything still queued by [`send_data`]
+    /// before signalling the `FIN`. A stream finished at the wrong offset
+    /// truncates silently: the peer sees a complete stream that is short.
+    ///
+    /// [`send_data`]: SendStream::send_data
     fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>>;
 
     /// Abruptly terminate the sending half with a `RESET_STREAM`.
@@ -204,7 +210,7 @@ impl StreamId {
     ///
     /// Stream IDs are QUIC variable-length integers, so they are capped at
     /// 2^62 - 1.
-    pub const MAX: u64 = (1 << 62) - 1;
+    pub const MAX: u64 = u64::MAX >> 2;
 
     /// Create a `StreamId` from its wire value.
     ///
@@ -235,6 +241,15 @@ impl fmt::Display for StreamId {
 /// [`Buf`]; write its bytes to the stream in order. It exists so that the
 /// HTTP/3 frame header and the body bytes it describes can travel together
 /// without being copied into one contiguous buffer first.
+///
+/// # Stability
+///
+/// This type is opaque, but its *contents* are produced by the HTTP/3
+/// implementation hyper builds on, so its size and the exact byte sequence it
+/// yields track that implementation rather than hyper's own versioning. Its
+/// public shape — an opaque `Buf` — is what backends depend on, and that is
+/// what will be kept. Backends must not assume anything about the length or
+/// framing of what they read out of it.
 pub struct WriteBuf<B> {
     inner: h3::quic::WriteBuf<B>,
 }
