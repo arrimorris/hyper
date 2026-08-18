@@ -443,6 +443,113 @@ async fn graceful_shutdown_finishes_inflight_request() {
         .expect("graceful shutdown is not an error");
 }
 
+/// A request that never made it onto the wire must come back to the caller.
+///
+/// Once the peer has sent GOAWAY, opening a new QUIC stream fails before a
+/// single byte of the request is serialized. Nothing about that request is
+/// spent, so `try_send_request` hands it back and a pool can put it on a
+/// fresh connection instead of failing it. For a client on a flaky network
+/// this is the difference between a retry and a lost submission.
+#[tokio::test]
+async fn a_request_that_never_left_is_handed_back() {
+    let tls = tls();
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let started = Arc::new(tokio::sync::Mutex::new(Some(started_tx)));
+    let release = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+
+    let endpoint =
+        Endpoint::server(tls.server.clone(), (Ipv4Addr::LOCALHOST, 0).into()).expect("endpoint");
+    let addr = endpoint.local_addr().unwrap();
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let incoming = endpoint.accept().await.expect("a connection");
+        let conn = incoming.await.expect("quic handshake");
+
+        let service = service_fn(move |_req: Request<Incoming>| {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            async move {
+                if let Some(tx) = started.lock().await.take() {
+                    let _ = tx.send(());
+                }
+                if let Some(rx) = release.lock().await.take() {
+                    let _ = rx.await;
+                }
+                Ok::<_, Infallible>(Response::new(full("held open")))
+            }
+        });
+
+        let conn = server_http3::Builder::new(TokioExecutor)
+            .serve_connection(quic::Connection::new(conn), service);
+        tokio::pin!(conn);
+
+        tokio::select! {
+            res = conn.as_mut() => return res,
+            _ = shutdown_rx => {}
+        }
+
+        // GOAWAY goes out, but the connection stays up: the first request is
+        // still being served, which is exactly the window a late request
+        // arrives in.
+        conn.as_mut().graceful_shutdown();
+        conn.await
+    });
+
+    let (_endpoint, mut send_request) = connect(&tls, addr).await;
+    let mut first = send_request.clone();
+    let first = tokio::spawn(async move { first.send_request(get("/slow")).await });
+
+    started_rx.await.unwrap();
+    shutdown_tx.send(()).unwrap();
+
+    // Wait for the GOAWAY to actually land before asking for another request.
+    // Until it does, the request is sent and the server rejects the stream
+    // instead — a real failure, but not the one under test.
+    let mut recovered = None;
+    for _ in 0..100 {
+        let mut req = get("/late");
+        req.headers_mut()
+            .insert("x-marker", "keep-me".parse().unwrap());
+
+        match send_request.try_send_request(req).await {
+            Ok(_) => {}
+            Err(mut err) => {
+                if let Some(req) = err.take_message() {
+                    recovered = Some(req);
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let recovered = recovered
+        .expect("a request rejected before it was serialized must be returned via TrySendError");
+    assert_eq!(recovered.uri().path(), "/late");
+    assert_eq!(
+        recovered.headers().get("x-marker").unwrap(),
+        "keep-me",
+        "the caller gets its own request back, headers and all"
+    );
+    assert_eq!(
+        recovered.version(),
+        Version::HTTP_11,
+        "the request comes back as it was handed in, not rewritten for HTTP/3"
+    );
+
+    release_tx.send(()).unwrap();
+    let res = first.await.unwrap().unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("the connection future must resolve")
+        .unwrap()
+        .expect("graceful shutdown is not an error");
+}
+
 /// Dropping the future returned by `send_request` is how hyper cancels an
 /// in-flight request. On HTTP/3 that must reset this one QUIC stream — the
 /// peer should find out, rather than keep working on a request nobody wants.

@@ -230,8 +230,15 @@ where
                         self.goaway_requested = true;
                         continue;
                     }
-                    self.state = State::Done;
-                    return Poll::Ready(Ok(()));
+                    // No more requests are coming, but that is not the same as
+                    // being finished: fall through to the drain below so the
+                    // ones already accepted still get to answer. h3 decides
+                    // "no more requests" from its own bookkeeping, which is
+                    // not hyper's — it stops tracking a request when both
+                    // halves of its stream drop, while hyper keeps counting
+                    // until the task around them is gone, and it never learns
+                    // about a request whose head failed to parse. Ending here
+                    // would cut those short.
                 }
                 Poll::Ready(Err(err)) => {
                     self.state = State::Done;

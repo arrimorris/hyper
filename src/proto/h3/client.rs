@@ -236,6 +236,21 @@ async fn exchange<O, B, E>(
     E: Http3ClientConnExec + Send + 'static,
 {
     let (mut parts, body) = req.into_parts();
+
+    // Everything `send_request` below can fail on — the peer having sent
+    // GOAWAY, opening the QUIC stream, encoding the header block — happens
+    // before a single byte of this request reaches the wire. So unlike
+    // HTTP/2, where the head is on a shared connection by the time anything
+    // can go wrong, HTTP/3 can always hand the request back for the caller to
+    // retry elsewhere. That is what `TrySendError::take_message` is for, and
+    // it is what lets a pool survive the peer going away mid-flight instead
+    // of failing the request outright.
+    //
+    // Taken before the rewrites below so what comes back is the caller's own
+    // request, not hyper's HTTP/3 rendering of it — the retry may well go out
+    // over a different protocol.
+    let retry = parts.clone();
+
     strip_connection_headers(&mut parts.headers, MessageKind::Request);
     if let Some(len) = body.size_hint().exact() {
         if len != 0 || headers::method_has_defined_payload_semantics(&parts.method) {
@@ -252,7 +267,7 @@ async fn exchange<O, B, E>(
         Err(err) => {
             cb.send(Err(TrySendError {
                 error: crate::Error::new_h3_stream(err),
-                message: None,
+                message: Some(Request::from_parts(retry, body)),
             }));
             return;
         }
