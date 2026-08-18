@@ -293,14 +293,28 @@ where
 
 /// Send the GREASE frame on the first request of a connection only.
 ///
-/// h3 clears this flag itself inside `Connection::accept`, but hyper drives
-/// the poll-based accept path instead, so it has to do the same — otherwise
-/// every request stream would carry a GREASE frame rather than just the first.
+/// h3 seeds this flag from its builder's `send_grease`, copies it into every
+/// `RequestResolver`, and emits the frame from `RequestStream::finish`. The
+/// "once per connection" part comes from `Connection::accept` clearing the
+/// connection-level flag immediately after it builds the first resolver.
+/// hyper drives the poll-based accept path instead of `accept`, so it has to
+/// clear the flag too; otherwise every response would carry a GREASE frame and
+/// pay for an extra frame write.
 ///
-/// This is the one place hyper touches a field of h3's `Connection` rather
+/// This is the one place hyper touches a *field* of h3's `Connection` rather
 /// than calling a method, and h3 marks that field as a deliberate, temporary
-/// break in its own encapsulation. Written against h3 0.0.8; re-check on any
-/// h3 upgrade, and drop this entirely if h3 grows a way to say it.
+/// break in its own encapsulation. Written against h3 0.0.8.
+///
+/// The upstream fix is one line: move the `send_grease_frame = false` out of
+/// `Connection::accept` and into `create_resolver_internal`, which every
+/// caller — `accept` and embedders alike — already goes through. That makes
+/// the public `create_resolver` correct on its own and lets this function be
+/// deleted. It changes `create_resolver` to take `&mut self`, which is exactly
+/// the kind of change the `i-implement-a-third-party-backend...` feature
+/// exists to permit.
+///
+/// Until then: if a future h3 renames or removes the field this fails to
+/// compile rather than misbehaving, which is the failure mode to want.
 fn suppress_further_grease<C, B>(conn: &mut h3::server::Connection<C, B>)
 where
     C: h3::quic::Connection<B>,
