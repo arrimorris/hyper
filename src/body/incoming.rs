@@ -362,10 +362,10 @@ impl Body for Incoming {
                 hyper_unstable_quic,
                 any(feature = "client", feature = "server")
             ))]
-            Kind::H3 {
-                content_length,
-                recv,
-            } => *content_length == DecodedLength::ZERO || recv.is_end_stream(),
+            // Deliberately not consulting `content_length`: HTTP/3 delimits
+            // with the QUIC stream's FIN, and a zero-length body can still be
+            // followed by trailers. Only the stream knows when it has ended.
+            Kind::H3 { recv, .. } => recv.is_end_stream(),
             #[cfg(feature = "ffi")]
             Kind::Ffi(..) => false,
         }

@@ -153,7 +153,11 @@ pub(super) fn method_has_defined_payload_semantics(method: &Method) -> bool {
 
 #[cfg(any(
     feature = "http2",
-    all(feature = "http3", hyper_unstable_quic, feature = "client")
+    all(
+        feature = "http3",
+        hyper_unstable_quic,
+        any(feature = "client", feature = "server")
+    )
 ))]
 pub(super) fn set_content_length_if_missing(headers: &mut HeaderMap, len: u64) {
     headers

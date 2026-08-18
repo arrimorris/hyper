@@ -538,6 +538,111 @@ async fn large_response_body_survives_flow_control() {
     }
 }
 
+/// A response body must keep streaming after the last `SendRequest` is
+/// dropped. Dropping the sender means "no more requests", not "abandon the
+/// response I am already reading".
+#[tokio::test]
+async fn response_body_survives_dropping_the_sender() {
+    let tls = tls();
+    let addr = spawn_server(
+        &tls,
+        service_fn(|_req: Request<Incoming>| async move {
+            // Dribbled out, so the body is definitely still in flight when the
+            // sender goes away rather than already buffered on the client.
+            let chunks = futures_util::stream::unfold(0usize, |n| async move {
+                if n >= 10 {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Some((
+                    Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"chunk"))),
+                    n + 1,
+                ))
+            });
+            Ok::<_, Infallible>(Response::new(StreamBody::new(chunks).boxed()))
+        }),
+    );
+
+    let (_endpoint, mut send_request) = connect(&tls, addr).await;
+    let res = send_request.send_request(get("/stream")).await.unwrap();
+
+    // The caller is done issuing requests, but not done reading this one.
+    drop(send_request);
+
+    let body = tokio::time::timeout(Duration::from_secs(10), res.into_body().collect())
+        .await
+        .expect("reading the body must not hang")
+        .expect("the connection must stay up while a response body is unread")
+        .to_bytes();
+    assert_eq!(body.len(), 50);
+}
+
+/// `is_end_stream` must reflect the QUIC stream, not the content-length.
+/// A zero-length body can still be followed by trailers.
+#[tokio::test]
+async fn zero_length_body_with_trailers_is_not_end_of_stream() {
+    let tls = tls();
+    let addr = spawn_server(
+        &tls,
+        service_fn(|_req: Request<Incoming>| async move {
+            let mut trailers = HeaderMap::new();
+            trailers.insert("x-checksum", "abc123".parse().unwrap());
+            let frames =
+                futures_util::stream::iter(vec![Ok::<_, Infallible>(Frame::trailers(trailers))]);
+            Ok::<_, Infallible>(
+                Response::builder()
+                    .header("content-length", "0")
+                    .body(StreamBody::new(frames).boxed())
+                    .unwrap(),
+            )
+        }),
+    );
+
+    let (_endpoint, mut send_request) = connect(&tls, addr).await;
+    let res = send_request
+        .send_request(get("/trailers-only"))
+        .await
+        .unwrap();
+
+    let body = res.into_body();
+    assert!(
+        !body.is_end_stream(),
+        "trailers are still pending, so this is not the end of the stream"
+    );
+
+    let collected = body.collect().await.unwrap();
+    assert_eq!(
+        collected
+            .trailers()
+            .and_then(|t| t.get("x-checksum"))
+            .expect("trailers must survive a zero-length body"),
+        "abc123"
+    );
+}
+
+/// A response body with a known size gets a `content-length`, as it does on
+/// HTTP/2, without the service having to set one.
+#[tokio::test]
+async fn response_gets_automatic_content_length() {
+    let tls = tls();
+    let addr = spawn_server(
+        &tls,
+        service_fn(|_req: Request<Incoming>| async move {
+            Ok::<_, Infallible>(Response::new(full("twelve bytes")))
+        }),
+    );
+
+    let (_endpoint, mut send_request) = connect(&tls, addr).await;
+    let res = send_request.send_request(get("/sized")).await.unwrap();
+
+    assert_eq!(
+        res.headers()
+            .get("content-length")
+            .map(|v| v.to_str().unwrap()),
+        Some("12")
+    );
+}
+
 // ===== being mean to the connection =====
 
 /// Wi-Fi to cellular, mid-request.

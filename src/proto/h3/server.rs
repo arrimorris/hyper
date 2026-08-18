@@ -19,7 +19,7 @@ use crate::body::{Body, DecodedLength, Incoming as IncomingBody};
 use crate::common::date;
 use crate::common::future::poll_fn;
 use crate::headers;
-use crate::proto::h3::{glue, ServerRecvBody};
+use crate::proto::h3::{glue, ServerRecvBody, TaskGuard};
 use crate::proto::{strip_connection_headers, MessageKind};
 use crate::rt::bounds::Http3ServerConnExec;
 use crate::rt::quic;
@@ -87,7 +87,6 @@ type GoingAway<Q, B> = Pin<
 enum State<Q, B>
 where
     Q: quic::Connection<B>,
-    Q::BidiStream: quic::BidiStream<B>,
     B: Buf,
 {
     Handshaking(Handshaking<Q, B>),
@@ -102,7 +101,6 @@ where
 pub(crate) struct Server<Q, S, B, E>
 where
     Q: quic::Connection<B>,
-    Q::BidiStream: quic::BidiStream<B>,
     B: Buf,
 {
     state: State<Q, B>,
@@ -113,19 +111,21 @@ where
     goaway_requested: bool,
     /// Set once GOAWAY has actually been written.
     goaway_sent: bool,
-    /// Cloned into every in-flight request task; dropped when the task ends.
+    /// Requests accepted but not yet answered.
     ///
-    /// Taking this out and then polling `tasks_rx` to `None` is how the
-    /// connection learns that every request it accepted has been answered.
-    /// h3 keeps that bookkeeping to itself, so hyper keeps its own.
-    tasks_tx: Option<mpsc::UnboundedSender<()>>,
+    /// h3 keeps that bookkeeping to itself, so hyper keeps its own. Counting
+    /// rather than watching for the last sender to drop is what lets requests
+    /// accepted *after* GOAWAY — the `max_late_requests` window — still hold
+    /// the connection open.
+    inflight: usize,
+    tasks_tx: mpsc::UnboundedSender<()>,
     tasks_rx: mpsc::UnboundedReceiver<()>,
 }
 
 impl<Q, S, B, E> Server<Q, S, B, E>
 where
     Q: quic::Connection<B> + Send + 'static,
-    Q::BidiStream: quic::BidiStream<B> + Send + 'static,
+    Q::BidiStream: Send + 'static,
     Q::SendStream: Send + 'static,
     Q::RecvStream: Send + 'static,
     Q::OpenStreams: Send + 'static,
@@ -145,7 +145,8 @@ where
             config,
             goaway_requested: false,
             goaway_sent: false,
-            tasks_tx: Some(tasks_tx),
+            inflight: 0,
+            tasks_tx,
             tasks_rx,
         }
     }
@@ -160,7 +161,7 @@ where
 impl<Q, S, B, E, Bd> Server<Q, S, B, E>
 where
     Q: quic::Connection<B> + Send + 'static,
-    Q::BidiStream: quic::BidiStream<B> + Send + 'static,
+    Q::BidiStream: Send + 'static,
     Q::SendStream: Send + 'static,
     Q::RecvStream: Send + 'static,
     Q::OpenStreams: Send + 'static,
@@ -196,9 +197,6 @@ where
                 State::GoingAway(fut) => {
                     let (conn, result) = ready!(fut.as_mut().poll(cx));
                     self.goaway_sent = true;
-                    // No further requests will be accepted, so stop holding a
-                    // sender open; `tasks_rx` can now reach its end.
-                    self.tasks_tx = None;
                     if let Err(err) = result {
                         self.state = State::Done;
                         return Poll::Ready(finish(err));
@@ -242,14 +240,18 @@ where
                 Poll::Pending => {}
             }
 
+            // Reap finished requests.
+            while let Poll::Ready(Some(())) = self.tasks_rx.poll_recv(cx) {
+                self.inflight -= 1;
+            }
+
             // GOAWAY is out; the connection is finished once every request it
-            // already accepted has been answered.
-            if self.goaway_sent {
-                if let Poll::Ready(None) = self.tasks_rx.poll_recv(cx) {
-                    trace!("http3 graceful shutdown complete");
-                    self.state = State::Done;
-                    return Poll::Ready(Ok(()));
-                }
+            // accepted — including any inside the `max_late_requests` window —
+            // has been answered.
+            if self.goaway_sent && self.inflight == 0 {
+                trace!("http3 graceful shutdown complete");
+                self.state = State::Done;
+                return Poll::Ready(Ok(()));
             }
 
             return Poll::Pending;
@@ -276,9 +278,11 @@ where
         ));
         suppress_further_grease(conn);
 
-        let guard = self.tasks_tx.clone();
         let service = self.service.clone();
         let date_header = self.config.date_header;
+
+        self.inflight += 1;
+        let guard = TaskGuard::new(self.tasks_tx.clone());
 
         self.exec.execute_h3stream(H3Stream::new(async move {
             // Dropped when this request finishes, which is what tells the
@@ -397,7 +401,7 @@ async fn serve_stream<C, B, S, Bd>(
 
     let content_length: DecodedLength = headers::content_length_parse_all(head.headers()).into();
     let mut req =
-        head.map(|()| IncomingBody::h3(Box::new(ServerRecvBody::new(recv)), content_length));
+        head.map(|()| IncomingBody::h3(Box::new(ServerRecvBody::new(recv, None)), content_length));
     *req.version_mut() = Version::HTTP_3;
 
     let res = match service.call(req).await {
@@ -412,6 +416,14 @@ async fn serve_stream<C, B, S, Bd>(
 
     let (mut head, body) = res.into_parts();
     strip_connection_headers(&mut head.headers, MessageKind::Response);
+
+    // Same as the HTTP/2 server: a body that knows its exact size gets a
+    // `content-length` if the service did not set one.
+    if !body.is_end_stream() {
+        if let Some(len) = body.size_hint().exact() {
+            headers::set_content_length_if_missing(&mut head.headers, len);
+        }
+    }
     if date_header {
         head.headers
             .entry(http::header::DATE)

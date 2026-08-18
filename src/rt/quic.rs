@@ -85,7 +85,11 @@ pub trait Connection<B: Buf>: OpenStreams<B> {
 /// The ability to open outgoing QUIC streams.
 pub trait OpenStreams<B: Buf> {
     /// Bidirectional streams opened by this side.
-    type BidiStream: SendStream<B> + RecvStream;
+    ///
+    /// These must be splittable: hyper hands a request body to a
+    /// [`Service`](crate::service::Service) while still writing the response on
+    /// the same stream, so it needs the two halves separately.
+    type BidiStream: BidiStream<B>;
 
     /// Unidirectional send streams opened by this side.
     type SendStream: SendStream<B>;

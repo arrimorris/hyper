@@ -20,7 +20,7 @@
 //! # async fn run<Q, E>(quic: Q, exec: E) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 //! # where
 //! #     Q: quic::Connection<Bytes> + Send + 'static,
-//! #     Q::BidiStream: quic::BidiStream<Bytes> + Send + 'static,
+//! #     Q::BidiStream: Send + 'static,
 //! #     Q::SendStream: Send + 'static,
 //! #     Q::RecvStream: Send + Sync + 'static,
 //! #     Q::OpenStreams: Send + 'static,
@@ -68,7 +68,6 @@ pin_project! {
     where
         S: HttpService<IncomingBody>,
         Q: quic::Connection<<S::ResBody as Body>::Data>,
-        Q::BidiStream: quic::BidiStream<<S::ResBody as Body>::Data>,
     {
         conn: proto::h3::server::Server<Q, S, <S::ResBody as Body>::Data, E>,
     }
@@ -90,7 +89,6 @@ impl<Q, S, E> fmt::Debug for Connection<Q, S, E>
 where
     S: HttpService<IncomingBody>,
     Q: quic::Connection<<S::ResBody as Body>::Data>,
-    Q::BidiStream: quic::BidiStream<<S::ResBody as Body>::Data>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Connection").finish()
@@ -106,7 +104,7 @@ where
     B::Data: Send + Sync + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     Q: quic::Connection<B::Data> + Send + 'static,
-    Q::BidiStream: quic::BidiStream<B::Data> + Send + 'static,
+    Q::BidiStream: Send + 'static,
     Q::SendStream: Send + 'static,
     Q::RecvStream: Send + Sync + 'static,
     Q::OpenStreams: Send + 'static,
@@ -139,7 +137,7 @@ where
     B::Data: Send + Sync + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     Q: quic::Connection<B::Data> + Send + 'static,
-    Q::BidiStream: quic::BidiStream<B::Data> + Send + 'static,
+    Q::BidiStream: Send + 'static,
     Q::SendStream: Send + 'static,
     Q::RecvStream: Send + Sync + 'static,
     Q::OpenStreams: Send + 'static,
@@ -248,7 +246,7 @@ impl<E> Builder<E> {
         Bd::Data: Send + Sync + 'static,
         Bd::Error: Into<Box<dyn StdError + Send + Sync>>,
         Q: quic::Connection<Bd::Data> + Send + 'static,
-        Q::BidiStream: quic::BidiStream<Bd::Data> + Send + 'static,
+        Q::BidiStream: Send + 'static,
         Q::SendStream: Send + 'static,
         Q::RecvStream: Send + Sync + 'static,
         Q::OpenStreams: Send + 'static,

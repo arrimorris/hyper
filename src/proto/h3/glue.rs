@@ -65,7 +65,6 @@ pub(crate) struct Conn<Q>(pub(crate) Q);
 impl<Q, B> h3::quic::Connection<B> for Conn<Q>
 where
     Q: quic::Connection<B>,
-    Q::BidiStream: quic::BidiStream<B>,
     B: Buf,
 {
     type RecvStream = RecvStream<Q::RecvStream>;
@@ -101,7 +100,6 @@ where
 impl<Q, B> h3::quic::OpenStreams<B> for Conn<Q>
 where
     Q: quic::Connection<B>,
-    Q::BidiStream: quic::BidiStream<B>,
     B: Buf,
 {
     type BidiStream = BidiStream<Q::BidiStream>;
@@ -149,7 +147,6 @@ impl<O: Clone> Clone for OpenStreams<O> {
 impl<O, B> h3::quic::OpenStreams<B> for OpenStreams<O>
 where
     O: quic::OpenStreams<B>,
-    O::BidiStream: quic::BidiStream<B>,
     B: Buf,
 {
     type BidiStream = BidiStream<O::BidiStream>;

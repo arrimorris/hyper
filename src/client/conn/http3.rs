@@ -64,7 +64,6 @@ pin_project! {
     pub struct Connection<Q, B, E>
     where
         Q: quic::Connection<B::Data>,
-        Q::BidiStream: quic::BidiStream<B::Data>,
         B: Body,
     {
         inner: proto::h3::client::ClientTask<Q, B, E>,
@@ -98,7 +97,7 @@ pub async fn handshake<E, Q, B>(
 ) -> crate::Result<(SendRequest<B>, Connection<Q, B, E>)>
 where
     Q: quic::Connection<B::Data> + Send + 'static,
-    Q::BidiStream: quic::BidiStream<B::Data> + Send + 'static,
+    Q::BidiStream: Send + 'static,
     Q::SendStream: Send + 'static,
     Q::RecvStream: Send + 'static,
     Q::OpenStreams: Clone + Send + 'static,
@@ -243,7 +242,6 @@ impl<B> fmt::Debug for SendRequest<B> {
 impl<Q, B, E> fmt::Debug for Connection<Q, B, E>
 where
     Q: quic::Connection<B::Data>,
-    Q::BidiStream: quic::BidiStream<B::Data>,
     B: Body,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -254,7 +252,7 @@ where
 impl<Q, B, E> Future for Connection<Q, B, E>
 where
     Q: quic::Connection<B::Data> + Send + 'static,
-    Q::BidiStream: quic::BidiStream<B::Data> + Send + 'static,
+    Q::BidiStream: Send + 'static,
     Q::SendStream: Send + 'static,
     Q::RecvStream: Send + 'static,
     Q::OpenStreams: Clone + Send + 'static,
@@ -341,7 +339,7 @@ impl<Ex> Builder<Ex> {
     ) -> impl Future<Output = crate::Result<(SendRequest<B>, Connection<Q, B, Ex>)>>
     where
         Q: quic::Connection<B::Data> + Send + 'static,
-        Q::BidiStream: quic::BidiStream<B::Data> + Send + 'static,
+        Q::BidiStream: Send + 'static,
         Q::SendStream: Send + 'static,
         Q::RecvStream: Send + 'static,
         Q::OpenStreams: Clone + Send + 'static,

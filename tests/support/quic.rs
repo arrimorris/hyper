@@ -413,6 +413,8 @@ pub struct RecvStream {
     stream: Option<quinn::RecvStream>,
     id: quinn::StreamId,
     reading: ReusableBoxFuture<'static, ReadChunk>,
+    /// Set when `stop_sending` is called while a read owns the stream.
+    pending_stop: Option<u64>,
 }
 
 impl RecvStream {
@@ -422,6 +424,7 @@ impl RecvStream {
             stream: Some(stream),
             // Allocates lazily, on the first read.
             reading: ReusableBoxFuture::new(async { unreachable!() }),
+            pending_stop: None,
         }
     }
 }
@@ -446,6 +449,12 @@ impl quic::RecvStream for RecvStream {
         };
         self.stream = Some(stream);
 
+        // A stop requested mid-read could not be applied then; apply it now
+        // that the stream is back in hand.
+        if let Some(code) = self.pending_stop.take() {
+            self.stop_sending(code);
+        }
+
         Poll::Ready(match chunk {
             // Handing back `Bytes` straight from quinn is what keeps the read
             // path copy-free all the way into `hyper::body::Incoming`.
@@ -455,8 +464,18 @@ impl quic::RecvStream for RecvStream {
     }
 
     fn stop_sending(&mut self, error_code: u64) {
-        if let Some(stream) = self.stream.as_mut() {
-            let _ = stream.stop(VarInt::from_u64(error_code).unwrap_or(VarInt::MAX));
+        match self.stream.as_mut() {
+            Some(stream) => {
+                let _ = stream.stop(VarInt::from_u64(error_code).unwrap_or(VarInt::MAX));
+            }
+            // A read is in flight and owns the stream, so it cannot be stopped
+            // right now. Remember the code for the next `poll_data`.
+            //
+            // If there is no next poll — the usual case, an abandoned body —
+            // quinn's own `RecvStream::drop` still sends `STOP_SENDING`, just
+            // with code 0 rather than the code asked for here. The peer stops
+            // either way; only the code differs.
+            None => self.pending_stop = Some(error_code),
         }
     }
 

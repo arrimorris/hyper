@@ -9,6 +9,7 @@
 use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::Buf;
@@ -20,7 +21,7 @@ use crate::body::{Body, DecodedLength, Incoming as IncomingBody};
 use crate::client::dispatch::{Callback, TrySendError};
 use crate::common::future::poll_fn;
 use crate::headers;
-use crate::proto::h3::{glue, ClientRecvBody};
+use crate::proto::h3::{glue, ClientRecvBody, TaskGuard};
 use crate::proto::{strip_connection_headers, MessageKind};
 use crate::rt::bounds::Http3ClientConnExec;
 use crate::rt::quic;
@@ -66,7 +67,7 @@ pub(crate) async fn handshake<Q, B, E>(
 ) -> crate::Result<ClientTask<Q, B, E>>
 where
     Q: quic::Connection<B::Data> + Send + 'static,
-    Q::BidiStream: quic::BidiStream<B::Data> + Send + 'static,
+    Q::BidiStream: Send + 'static,
     Q::SendStream: Send + 'static,
     Q::RecvStream: Send + 'static,
     Q::OpenStreams: Clone + Send + 'static,
@@ -91,7 +92,8 @@ where
         req_rx,
         exec,
         closing: false,
-        tasks_tx: Some(tasks_tx),
+        inflight: 0,
+        tasks_tx,
         tasks_rx,
     })
 }
@@ -100,7 +102,6 @@ where
 pub(crate) struct ClientTask<Q, B, E>
 where
     Q: quic::Connection<B::Data>,
-    Q::BidiStream: quic::BidiStream<B::Data>,
     B: Body,
 {
     h3: h3::client::Connection<glue::Conn<Q>, B::Data>,
@@ -108,14 +109,18 @@ where
     req_rx: ClientRx<B>,
     exec: E,
     closing: bool,
-    tasks_tx: Option<mpsc::UnboundedSender<()>>,
+    /// Requests that have been dispatched but are not finished with the
+    /// connection yet. A request stays counted until its exchange, its upload
+    /// and its response body have all been dropped.
+    inflight: usize,
+    tasks_tx: mpsc::UnboundedSender<()>,
     tasks_rx: mpsc::UnboundedReceiver<()>,
 }
 
 impl<Q, B, E> ClientTask<Q, B, E>
 where
     Q: quic::Connection<B::Data> + Send + 'static,
-    Q::BidiStream: quic::BidiStream<B::Data> + Send + 'static,
+    Q::BidiStream: Send + 'static,
     Q::SendStream: Send + 'static,
     Q::RecvStream: Send + 'static,
     Q::OpenStreams: Clone + Send + 'static,
@@ -138,20 +143,21 @@ where
                     Poll::Ready(None) => {
                         trace!("http3 client dropped all senders");
                         self.closing = true;
-                        // Let `tasks_rx` reach its end once the requests
-                        // already in flight have finished.
-                        self.tasks_tx = None;
                         continue;
                     }
                     Poll::Pending => {}
                 }
             }
 
-            if self.closing {
-                if let Poll::Ready(None) = self.tasks_rx.poll_recv(cx) {
-                    trace!("http3 client connection idle, closing");
-                    return Poll::Ready(Ok(()));
-                }
+            // Reap finished requests. Dropping every `SendRequest` means "no
+            // more requests", not "abandon the responses I am still reading",
+            // so the connection only ends once nothing is in flight.
+            while let Poll::Ready(Some(())) = self.tasks_rx.poll_recv(cx) {
+                self.inflight -= 1;
+            }
+            if self.closing && self.inflight == 0 {
+                trace!("http3 client connection idle, closing");
+                return Poll::Ready(Ok(()));
             }
 
             // Drive the connection itself. This resolves only when the QUIC
@@ -167,12 +173,13 @@ where
 
     fn dispatch(&mut self, req: Request<B>, cb: Callback<Request<B>, Response<IncomingBody>>) {
         let send_request = self.send_request.clone();
-        let guard = self.tasks_tx.clone();
         let exec = self.exec.clone();
 
+        self.inflight += 1;
+        let guard = Arc::new(TaskGuard::new(self.tasks_tx.clone()));
+
         self.exec.execute_h3_future(H3ClientFuture::new(async move {
-            let _guard = guard;
-            exchange(send_request, req, cb, exec).await;
+            exchange(send_request, req, cb, exec, guard).await;
         }));
     }
 }
@@ -217,6 +224,7 @@ async fn exchange<O, B, E>(
     req: Request<B>,
     mut cb: Callback<Request<B>, Response<IncomingBody>>,
     mut exec: E,
+    guard: Arc<TaskGuard>,
 ) where
     O: h3::quic::OpenStreams<B::Data> + Clone + Send + 'static,
     O::BidiStream: h3::quic::BidiStream<B::Data> + Send + 'static,
@@ -260,7 +268,9 @@ async fn exchange<O, B, E>(
     // finished normally and the upload should carry on.
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
 
+    let upload_guard = Arc::clone(&guard);
     exec.execute_h3_future(H3ClientFuture::new(async move {
+        let _guard = upload_guard;
         let outcome = {
             let mut pump = std::pin::pin!(send_body(&mut send, body));
             let mut cancel = cancel_rx;
@@ -331,8 +341,12 @@ async fn exchange<O, B, E>(
     };
 
     let content_length: DecodedLength = headers::content_length_parse_all(head.headers()).into();
-    let mut res =
-        head.map(|()| IncomingBody::h3(Box::new(ClientRecvBody::new(recv)), content_length));
+    let mut res = head.map(|()| {
+        IncomingBody::h3(
+            Box::new(ClientRecvBody::new(recv, Some(guard))),
+            content_length,
+        )
+    });
     *res.version_mut() = Version::HTTP_3;
 
     cb.send(Ok(res));

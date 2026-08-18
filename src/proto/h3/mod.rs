@@ -34,6 +34,30 @@ pub(crate) fn conn_error(err: h3::error::ConnectionError) -> Option<crate::Error
     }
 }
 
+// ===== in-flight request tracking =====
+
+/// Held for as long as one request is still in flight.
+///
+/// A request is not finished when its task is: the response body outlives the
+/// exchange that produced it, and the request body may still be uploading. So
+/// this is shared (via `Arc`) by every piece a single request owns, and the
+/// connection only hears about the request once the last of them is dropped.
+pub(crate) struct TaskGuard(tokio::sync::mpsc::UnboundedSender<()>);
+
+impl TaskGuard {
+    pub(crate) fn new(tx: tokio::sync::mpsc::UnboundedSender<()>) -> Self {
+        TaskGuard(tx)
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        // The connection future decrements its in-flight count for each of
+        // these. A send failure just means the connection is already gone.
+        let _ = self.0.send(());
+    }
+}
+
 // ===== bodies =====
 
 /// The receiving half of an HTTP/3 request or response body.
@@ -85,6 +109,8 @@ macro_rules! recv_body {
         {
             stream: $stream,
             state: RecvState,
+            /// Keeps the connection alive while this body is still readable.
+            _guard: Option<std::sync::Arc<TaskGuard>>,
         }
 
         impl<S, B> $name<S, B>
@@ -92,10 +118,11 @@ macro_rules! recv_body {
             S: h3::quic::RecvStream,
             B: Buf,
         {
-            pub(crate) fn new(stream: $stream) -> Self {
+            pub(crate) fn new(stream: $stream, guard: Option<std::sync::Arc<TaskGuard>>) -> Self {
                 Self {
                     stream,
                     state: RecvState::Data,
+                    _guard: guard,
                 }
             }
         }
