@@ -7,6 +7,18 @@
 //! this module is handed a whole QUIC connection: anything implementing
 //! [`hyper::rt::quic::Connection`](crate::rt::quic::Connection).
 //!
+//! # ALPN
+//!
+//! HTTP/3 is identified by the ALPN token `h3` ([RFC 9114 §3.1]), negotiated
+//! by the QUIC layer's TLS configuration. That happens below anything this
+//! module can see, so hyper cannot check it or set it for you: a peer that
+//! offers a different token fails the QUIC handshake, and the connection
+//! never reaches [`Builder::serve_connection`]. Configure it wherever your QUIC
+//! backend takes its TLS settings — for quinn, `rustls`'s
+//! `alpn_protocols`; see the `http3_server` example.
+//!
+//! [RFC 9114 §3.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-3.1
+//!
 //! # Example
 //!
 //! ```no_run
@@ -116,7 +128,10 @@ where
     ///
     /// A `GOAWAY` frame is sent, telling the peer not to start new requests,
     /// and this `Connection` then resolves once every request it had already
-    /// accepted has been answered.
+    /// accepted has been answered. If nothing was in flight, it resolves as
+    /// soon as the frame is written — see
+    /// [`max_late_requests`](Builder::max_late_requests) for what that means
+    /// for requests still crossing the network.
     ///
     /// # Note
     ///
@@ -211,12 +226,30 @@ impl<E> Builder<E> {
         self
     }
 
-    /// Set how many requests past the last one already accepted may still be
-    /// served after a [graceful shutdown](Connection::graceful_shutdown)
-    /// begins.
+    /// Set how many request streams past the last one already accepted are
+    /// still worth serving once a
+    /// [graceful shutdown](Connection::graceful_shutdown) has begun.
     ///
-    /// This is the `GOAWAY` grace interval. Default is 0, which accepts no
-    /// further requests.
+    /// This widens the stream-id limit advertised in `GOAWAY`. Requests the
+    /// peer had already put on the wire when the frame went out land inside
+    /// the window and are served; ones beyond it are rejected with
+    /// `H3_REQUEST_REJECTED`, which tells the peer to retry them elsewhere.
+    /// Default is 0.
+    ///
+    /// # Note
+    ///
+    /// The window only applies for as long as the connection is still
+    /// draining. If nothing is in flight when `GOAWAY` goes out, the
+    /// connection resolves right away and a request still crossing the
+    /// network is not waited for — the window widens what is *accepted*, it
+    /// does not hold an idle connection open. Waiting would mean waiting on a
+    /// peer that may simply have nothing more to send, and hyper has no clock
+    /// here to bound that. HTTP/2 gets the equivalent guarantee from its
+    /// `PING`-acknowledged two-stage `GOAWAY` (RFC 9113 §6.8); HTTP/3
+    /// describes the same procedure in [RFC 9114 §5.2], but `h3` exposes no
+    /// way to wait for the acknowledgement.
+    ///
+    /// [RFC 9114 §5.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-5.2
     pub fn max_late_requests(&mut self, max: usize) -> &mut Self {
         self.h3_builder.max_late_requests = max;
         self

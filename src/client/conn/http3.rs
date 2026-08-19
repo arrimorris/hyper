@@ -7,6 +7,18 @@
 //! this module is handed a whole QUIC connection: anything implementing
 //! [`hyper::rt::quic::Connection`](crate::rt::quic::Connection).
 //!
+//! # ALPN
+//!
+//! HTTP/3 is identified by the ALPN token `h3` ([RFC 9114 §3.1]), negotiated
+//! by the QUIC layer's TLS configuration. That happens below anything this
+//! module can see, so hyper cannot check it or set it for you: a peer that
+//! offers a different token fails the QUIC handshake, and the connection
+//! never reaches [`handshake`]. Configure it wherever your QUIC
+//! backend takes its TLS settings — for quinn, `rustls`'s
+//! `alpn_protocols`; see the `http3_client` example.
+//!
+//! [RFC 9114 §3.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-3.1
+//!
 //! # Connection migration
 //!
 //! A QUIC connection survives the client changing network. If the device drops

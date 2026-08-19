@@ -58,20 +58,27 @@ mod connection_headers {
             }
         }
 
-        #[cfg(not(feature = "client"))]
-        let _ = kind;
+        // Each half is gated on its own feature. Written as one `if`/`else`
+        // under `cfg(feature = "client")`, the `else` disappears along with
+        // the `if` in a server-only build and responses stop having their
+        // `TE` stripped at all.
         #[cfg(feature = "client")]
-        if matches!(kind, MessageKind::Request) {
-            if headers
+        if matches!(kind, MessageKind::Request)
+            && headers
                 .get(http::header::TE)
                 .map_or(false, |te_header| te_header != "trailers")
-            {
-                warn!("TE headers not set to \"trailers\" are illegal in HTTP/2+ requests");
-                headers.remove(http::header::TE);
-            }
-        } else if headers.remove(http::header::TE).is_some() {
+        {
+            warn!("TE headers not set to \"trailers\" are illegal in HTTP/2+ requests");
+            headers.remove(http::header::TE);
+        }
+
+        #[cfg(feature = "server")]
+        if matches!(kind, MessageKind::Response) && headers.remove(http::header::TE).is_some() {
             warn!("TE headers illegal in HTTP/2+ responses");
         }
+
+        #[cfg(not(any(feature = "client", feature = "server")))]
+        let _ = kind;
 
         if let Some(header) = headers.remove(CONNECTION) {
             warn!(
@@ -89,6 +96,68 @@ mod connection_headers {
                     let name = name.trim();
                     headers.remove(name);
                 }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            for (name, value) in pairs {
+                headers.append(
+                    HeaderName::from_static(name),
+                    http::HeaderValue::from_static(value),
+                );
+            }
+            headers
+        }
+
+        #[test]
+        fn strips_the_connection_headers() {
+            let mut h = headers(&[
+                ("keep-alive", "timeout=5"),
+                ("proxy-connection", "keep-alive"),
+                ("transfer-encoding", "chunked"),
+                ("upgrade", "websocket"),
+                ("connection", "x-hop"),
+                ("x-hop", "gone"),
+                ("x-keep", "kept"),
+            ]);
+
+            #[cfg(feature = "client")]
+            strip_connection_headers(&mut h, MessageKind::Request);
+            #[cfg(all(feature = "server", not(feature = "client")))]
+            strip_connection_headers(&mut h, MessageKind::Response);
+
+            assert_eq!(h.len(), 1);
+            assert_eq!(h["x-keep"], "kept");
+        }
+
+        #[cfg(feature = "client")]
+        #[test]
+        fn a_request_keeps_te_trailers_but_nothing_else() {
+            let mut h = headers(&[("te", "trailers")]);
+            strip_connection_headers(&mut h, MessageKind::Request);
+            assert_eq!(h["te"], "trailers");
+
+            let mut h = headers(&[("te", "gzip")]);
+            strip_connection_headers(&mut h, MessageKind::Request);
+            assert!(!h.contains_key("te"));
+        }
+
+        /// Gated on `server` alone: this used to ride along on the `client`
+        /// feature, so a server-only build never ran it.
+        #[cfg(feature = "server")]
+        #[test]
+        fn a_response_never_keeps_te() {
+            for value in ["trailers", "gzip"] {
+                let mut h = HeaderMap::new();
+                h.append(http::header::TE, http::HeaderValue::from_static(value));
+                strip_connection_headers(&mut h, MessageKind::Response);
+                assert!(!h.contains_key("te"), "TE: {value} survived a response");
             }
         }
     }
