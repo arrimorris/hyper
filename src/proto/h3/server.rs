@@ -325,7 +325,10 @@ where
 /// exists to permit.
 ///
 /// Until then: if a future h3 renames or removes the field this fails to
-/// compile rather than misbehaving, which is the failure mode to want.
+/// compile rather than misbehaving, which is the failure mode to want. The
+/// case that stays silent is h3 fixing it properly, since the field would
+/// still exist and this would just be redundant — so the h3 dependency in
+/// `Cargo.toml` carries a note to check here on every version bump.
 fn suppress_further_grease<C, B>(conn: &mut h3::server::Connection<C, B>)
 where
     C: h3::quic::Connection<B>,

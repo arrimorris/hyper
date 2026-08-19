@@ -36,6 +36,14 @@ h2 = { version = "0.4.14", optional = true }
 # embedder API. hyper is exactly that embedder: it implements `h3::quic` on
 # top of `hyper::rt::quic`, and drives the connection with h3's poll-based
 # accept loop instead of its `async fn` conveniences.
+#
+# Cargo reads `0.0.8` as `>=0.0.8, <0.0.9`, so every h3 bump edits this line.
+# When one does, check `suppress_further_grease` in `src/proto/h3/server.rs`:
+# it reaches into a field of h3's `Connection` because the public
+# `create_resolver` does not clear the GREASE flag itself. If h3 has moved
+# that clear into `create_resolver_internal`, the workaround is dead code and
+# should be deleted — nothing will fail if it is left in, which is why it is
+# worth looking for.
 h3 = { version = "0.0.8", optional = true, features = [
     "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
 ] }

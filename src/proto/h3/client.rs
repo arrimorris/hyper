@@ -375,6 +375,10 @@ enum Upload {
 }
 
 /// Pump a request body onto a request stream.
+///
+/// `send_data` awaits the QUIC stream's flow-control window before the next
+/// frame is polled off the body, so a server that stops reading stops the
+/// upload being produced rather than having it pile up in memory.
 async fn send_body<S, B, Bd>(
     send: &mut h3::client::RequestStream<S, B>,
     body: Bd,
@@ -409,6 +413,7 @@ where
                         .map_err(crate::Error::new_h3_stream)?;
                     return Ok(());
                 }
+                // Frame kinds hyper doesn't know how to send are skipped.
             }
         }
     }
