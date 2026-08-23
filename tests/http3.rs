@@ -443,6 +443,236 @@ async fn graceful_shutdown_finishes_inflight_request() {
         .expect("graceful shutdown is not an error");
 }
 
+/// A client that simply goes away is not a server error.
+///
+/// The last `SendRequest` dropping is how a caller says "done". If that
+/// reaches the server as anything other than a clean close, every ordinary
+/// disconnect shows up as a connection error in the log — which on a fleet of
+/// roaming devices is the entire log.
+#[tokio::test]
+async fn a_client_disconnecting_is_a_clean_close() {
+    let tls = tls();
+
+    let endpoint =
+        Endpoint::server(tls.server.clone(), (Ipv4Addr::LOCALHOST, 0).into()).expect("endpoint");
+    let addr = endpoint.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let incoming = endpoint.accept().await.expect("a connection");
+        let conn = incoming.await.expect("quic handshake");
+        server_http3::Builder::new(TokioExecutor)
+            .serve_connection(
+                quic::Connection::new(conn),
+                service_fn(|_req: Request<Incoming>| async move {
+                    Ok::<_, Infallible>(Response::new(full("bye")))
+                }),
+            )
+            .await
+    });
+
+    let (endpoint, mut send_request) = connect(&tls, addr).await;
+    let res = send_request.send_request(get("/")).await.unwrap();
+    assert_eq!(res.into_body().collect().await.unwrap().to_bytes(), "bye");
+
+    drop(send_request);
+
+    let result = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("the server connection must notice the client is gone")
+        .unwrap();
+    assert!(
+        result.is_ok(),
+        "a client hanging up must not surface as an error: {:?}",
+        result.err()
+    );
+
+    drop(endpoint);
+}
+
+/// And the same in the other direction: a server finishing a graceful
+/// shutdown is not a client error.
+///
+/// This one holds on its own — h3's server `Connection` closes with
+/// `H3_NO_ERROR` in its own `Drop`. It is here so the pair is covered, and so
+/// that a regression on either side is visible.
+#[tokio::test]
+async fn a_server_shutting_down_is_a_clean_close() {
+    let tls = tls();
+
+    let endpoint =
+        Endpoint::server(tls.server.clone(), (Ipv4Addr::LOCALHOST, 0).into()).expect("endpoint");
+    let addr = endpoint.local_addr().unwrap();
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let incoming = endpoint.accept().await.expect("a connection");
+        let conn = incoming.await.expect("quic handshake");
+        let conn = server_http3::Builder::new(TokioExecutor).serve_connection(
+            quic::Connection::new(conn),
+            service_fn(|_req: Request<Incoming>| async move {
+                Ok::<_, Infallible>(Response::new(full("bye")))
+            }),
+        );
+        tokio::pin!(conn);
+
+        tokio::select! {
+            _ = conn.as_mut() => return,
+            _ = shutdown_rx => {}
+        }
+        conn.as_mut().graceful_shutdown();
+        let _ = conn.await;
+    });
+
+    let mut client = Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).expect("client endpoint");
+    client.set_default_client_config(tls.client.clone());
+    let quic_conn = client
+        .connect(addr, "localhost")
+        .expect("connect")
+        .await
+        .expect("quic handshake");
+    let (mut send_request, connection) =
+        client_http3::handshake(TokioExecutor, quic::Connection::new(quic_conn))
+            .await
+            .expect("http3 handshake");
+    let driver = tokio::spawn(connection);
+
+    let res = send_request.send_request(get("/")).await.unwrap();
+    assert_eq!(res.into_body().collect().await.unwrap().to_bytes(), "bye");
+
+    shutdown_tx.send(()).unwrap();
+
+    // `send_request` is deliberately still alive, so the client is not the one
+    // ending the connection — the server is.
+    let result = tokio::time::timeout(Duration::from_secs(10), driver)
+        .await
+        .expect("the client connection must notice the server is gone")
+        .unwrap();
+    assert!(
+        result.is_ok(),
+        "a server shutting down must not surface as an error: {:?}",
+        result.err()
+    );
+
+    drop(send_request);
+    drop(client);
+}
+
+/// A service that answers early and keeps reading the upload must keep the
+/// connection with it, even into a graceful shutdown.
+///
+/// This is the ingest shape: accept the submission, return `202` so the device
+/// can stop waiting, and go on draining the body in the background. The
+/// response being finished does not mean the exchange is — the request stream
+/// is still open, and h3 still counts it — so shutting the connection down
+/// underneath the reader would silently truncate an upload that was
+/// mid-flight.
+#[tokio::test]
+async fn shutdown_waits_for_a_body_the_service_is_still_reading() {
+    let tls = tls();
+    let (answered_tx, answered_rx) = oneshot::channel::<()>();
+    let (read_tx, read_rx) = oneshot::channel::<Result<usize, String>>();
+    let answered = Arc::new(tokio::sync::Mutex::new(Some(answered_tx)));
+    let read = Arc::new(tokio::sync::Mutex::new(Some(read_tx)));
+
+    let endpoint =
+        Endpoint::server(tls.server.clone(), (Ipv4Addr::LOCALHOST, 0).into()).expect("endpoint");
+    let addr = endpoint.local_addr().unwrap();
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let incoming = endpoint.accept().await.expect("a connection");
+        let conn = incoming.await.expect("quic handshake");
+
+        let service = service_fn(move |req: Request<Incoming>| {
+            let answered = Arc::clone(&answered);
+            let read = Arc::clone(&read);
+            async move {
+                // Answer now, drain later — the request body outlives the
+                // response, and outlives `serve_stream` with it.
+                let body = req.into_body();
+                tokio::spawn(async move {
+                    let outcome = match body.collect().await {
+                        Ok(collected) => Ok(collected.to_bytes().len()),
+                        Err(err) => Err(err.to_string()),
+                    };
+                    if let Some(tx) = read.lock().await.take() {
+                        let _ = tx.send(outcome);
+                    }
+                });
+                if let Some(tx) = answered.lock().await.take() {
+                    let _ = tx.send(());
+                }
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(StatusCode::ACCEPTED)
+                        .body(empty())
+                        .unwrap(),
+                )
+            }
+        });
+
+        let conn = server_http3::Builder::new(TokioExecutor)
+            .serve_connection(quic::Connection::new(conn), service);
+        tokio::pin!(conn);
+
+        tokio::select! {
+            res = conn.as_mut() => return res,
+            _ = shutdown_rx => {}
+        }
+
+        conn.as_mut().graceful_shutdown();
+        conn.await
+    });
+
+    let (_endpoint, mut send_request) = connect(&tls, addr).await;
+
+    // 40 KiB dribbled out over ~2s, so most of it is still in flight when the
+    // shutdown begins.
+    const CHUNKS: usize = 40;
+    const CHUNK: usize = 1024;
+    let chunks = futures_util::stream::unfold(0usize, |n| async move {
+        if n >= CHUNKS {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Some((
+            Ok::<_, Infallible>(Frame::data(Bytes::from(vec![b'x'; CHUNK]))),
+            n + 1,
+        ))
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("https://localhost/telemetry")
+        .body(StreamBody::new(chunks).boxed())
+        .unwrap();
+    let request = tokio::spawn(async move { send_request.send_request(req).await });
+
+    // Shut down the moment the service has answered — the upload has barely
+    // started.
+    answered_rx.await.unwrap();
+    shutdown_tx.send(()).unwrap();
+
+    let res = request.await.unwrap().unwrap();
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+
+    let read = tokio::time::timeout(Duration::from_secs(20), read_rx)
+        .await
+        .expect("the background reader must finish")
+        .unwrap();
+    assert_eq!(
+        read,
+        Ok(CHUNKS * CHUNK),
+        "the upload was truncated by the shutdown"
+    );
+
+    tokio::time::timeout(Duration::from_secs(20), server)
+        .await
+        .expect("the connection future must resolve once the body is drained")
+        .unwrap()
+        .expect("graceful shutdown is not an error");
+}
+
 /// A request that never made it onto the wire must come back to the caller.
 ///
 /// Once the peer has sent GOAWAY, opening a new QUIC stream fails before a

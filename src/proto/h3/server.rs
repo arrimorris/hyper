@@ -8,6 +8,7 @@
 use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::Buf;
@@ -111,9 +112,13 @@ where
     goaway_requested: bool,
     /// Set once GOAWAY has actually been written.
     goaway_sent: bool,
-    /// Requests accepted but not yet answered.
+    /// Requests accepted but not yet finished with the connection.
     ///
-    /// h3 keeps that bookkeeping to itself, so hyper keeps its own. Counting
+    /// A request stays counted until its task has ended *and* its body has
+    /// been dropped, which are not the same moment: a service may answer
+    /// early and go on reading the upload.
+    ///
+    /// h3 keeps this bookkeeping to itself, so hyper keeps its own. Counting
     /// rather than watching for the last sender to drop is what lets requests
     /// accepted *after* GOAWAY — the `max_late_requests` window — still hold
     /// the connection open.
@@ -289,14 +294,18 @@ where
         let date_header = self.config.date_header;
 
         self.inflight += 1;
-        let guard = TaskGuard::new(self.tasks_tx.clone());
+        // Shared with the request body, so a service that answers early and
+        // goes on reading the upload still holds the connection open. Dropping
+        // the last clone is what tells the connection future that a graceful
+        // shutdown may complete.
+        let guard = Arc::new(TaskGuard::new(self.tasks_tx.clone()));
 
-        self.exec.execute_h3stream(H3Stream::new(async move {
-            // Dropped when this request finishes, which is what tells the
-            // connection future that a graceful shutdown may complete.
-            let _guard = guard;
-            serve_stream(resolver, service, date_header).await;
-        }));
+        self.exec.execute_h3stream(H3Stream::new(serve_stream(
+            resolver,
+            service,
+            date_header,
+            guard,
+        )));
 
         Poll::Ready(Ok(true))
     }
@@ -387,6 +396,7 @@ async fn serve_stream<C, B, S, Bd>(
     resolver: h3::server::RequestResolver<C, B>,
     mut service: S,
     date_header: bool,
+    guard: Arc<TaskGuard>,
 ) where
     C: h3::quic::Connection<B>,
     C::BidiStream: h3::quic::BidiStream<B>,
@@ -410,8 +420,16 @@ async fn serve_stream<C, B, S, Bd>(
     let (mut send, recv) = stream.split();
 
     let content_length: DecodedLength = headers::content_length_parse_all(head.headers()).into();
-    let mut req =
-        head.map(|()| IncomingBody::h3(Box::new(ServerRecvBody::new(recv, None)), content_length));
+    // The body carries a clone of the guard: the response finishing does not
+    // mean the exchange has. A service may answer early and keep draining the
+    // upload in the background, and the request stream is genuinely still open
+    // — h3 counts it too, because both halves hold its `RequestEnd`.
+    let mut req = head.map(|()| {
+        IncomingBody::h3(
+            Box::new(ServerRecvBody::new(recv, Some(Arc::clone(&guard)))),
+            content_length,
+        )
+    });
     *req.version_mut() = Version::HTTP_3;
 
     let res = match service.call(req).await {

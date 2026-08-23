@@ -78,6 +78,10 @@ where
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     E: Http3ClientConnExec + Send + 'static,
 {
+    // Taken before `quic` is handed to h3, which is the last chance to hold a
+    // handle onto the connection.
+    let closer = quic.opener();
+
     let (h3_conn, send_request) = config
         .h3_builder()
         .build(glue::Conn(quic))
@@ -93,6 +97,7 @@ where
         exec,
         closing: false,
         inflight: 0,
+        closer,
         tasks_tx,
         tasks_rx,
     })
@@ -113,6 +118,15 @@ where
     /// connection yet. A request stays counted until its exchange, its upload
     /// and its response body have all been dropped.
     inflight: usize,
+    /// Closes the QUIC connection when this task goes away.
+    ///
+    /// h3's *server* `Connection` closes with `H3_NO_ERROR` in its own `Drop`;
+    /// its client counterpart does not. Dropping the last `SendRequest` only
+    /// records the code and wakes the driver, and `poll_close` never reads it
+    /// back — so on a clean exit nothing emits it and the transport closes
+    /// implicitly with whatever code it picks. quinn picks 0, which the peer
+    /// reads as a real error rather than a hang-up. See RFC 9114 §5.2.
+    closer: Q::OpenStreams,
     tasks_tx: mpsc::UnboundedSender<()>,
     tasks_rx: mpsc::UnboundedReceiver<()>,
 }
@@ -181,6 +195,20 @@ where
         self.exec.execute_h3_future(H3ClientFuture::new(async move {
             exchange(send_request, req, cb, exec, guard).await;
         }));
+    }
+}
+
+impl<Q, B, E> Drop for ClientTask<Q, B, E>
+where
+    Q: quic::Connection<B::Data>,
+    B: Body,
+{
+    fn drop(&mut self) {
+        // Mirrors `h3::server::Connection`'s own `Drop`. Doing it here rather
+        // than on the way out of `poll_task` also covers the caller simply
+        // dropping the connection future. A second close is a no-op, so the
+        // error paths that h3 has already closed are unaffected.
+        quic::OpenStreams::close(&mut self.closer, h3::error::Code::H3_NO_ERROR.value(), b"");
     }
 }
 
