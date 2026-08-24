@@ -225,6 +225,13 @@ jobs:
       - name: Test
         run: cargo test --features http3,client,server --test http3
 
+      # Five minutes of wall clock, so not on every push to a pull request —
+      # but it is the test that proves the headline claim, so it runs on every
+      # merge rather than never.
+      - name: Test (slow)
+        if: github.event_name == 'push'
+        run: cargo test --features http3,client,server --test http3 -- --ignored
+
       - name: Build examples
         run: |
           cargo check --features http3,server --example http3_server

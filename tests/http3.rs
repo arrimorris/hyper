@@ -1115,8 +1115,14 @@ async fn survives_short_blackout_mid_request() {
 /// The real thing: five minutes with no signal at all, against an idle timeout
 /// that is longer than the outage.
 ///
-/// Ignored by default because it takes five minutes; run it with
-/// `cargo test --test http3 -- --ignored --nocapture`.
+/// `#[ignore]`d so it does not add five minutes to every pull request, not
+/// because it is optional: CI runs it on every merge to master, and it is the
+/// test the whole design is for. Locally, `cargo test --test http3 --
+/// --ignored --nocapture`.
+///
+/// The three-second case above exercises the same code; what this one adds is
+/// the duration itself — the timers, keep-alives and loss recovery underneath
+/// have five real minutes to get it wrong.
 #[tokio::test]
 #[ignore = "takes over five minutes by design"]
 async fn survives_five_minute_blackout_mid_request() {
